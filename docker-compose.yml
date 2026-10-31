@@ -40,7 +40,11 @@ services:
       MODEL_URI: ${MODEL_URI:-models:/fraud-detection@champion}
       # empty = use the threshold stored with the model
       FRAUD_THRESHOLD: ${FRAUD_THRESHOLD:-}
-      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      # Worker processes: about one per core given to the container (scoring is CPU-bound)
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
+      # > 0 turns on micro-batching of /predict (e.g. 2 ms); 0 = off
+      MICROBATCH_WAIT_MS: ${MICROBATCH_WAIT_MS:-0}
+      MICROBATCH_MAX_SIZE: ${MICROBATCH_MAX_SIZE:-64}
     ports:
       - "8000:8000"
     depends_on:

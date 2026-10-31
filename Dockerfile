@@ -21,7 +21,9 @@ COPY --from=builder --chown=app:app /app /app
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
 # One BLAS/OpenMP thread per worker: single-row scoring gains nothing from more, and
 # several workers would otherwise oversubscribe the CPUs. Scale with WEB_CONCURRENCY.
-ENV OMP_NUM_THREADS=1 WEB_CONCURRENCY=2 PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus
+# Micro-batching of /predict is off unless MICROBATCH_WAIT_MS > 0.
+ENV OMP_NUM_THREADS=1 WEB_CONCURRENCY=4 PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus \
+    MICROBATCH_WAIT_MS=0 MICROBATCH_MAX_SIZE=64
 USER app
 EXPOSE 8000
 # Liveness only: the API stays up (and healthy) without a model; /health/ready says why.
@@ -31,4 +33,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
 # only the current workers. Request logging is done by the app middleware.
 CMD rm -rf "$PROMETHEUS_MULTIPROC_DIR" && mkdir -p "$PROMETHEUS_MULTIPROC_DIR" \
     && exec uvicorn fraud_detection.api.main:app --host 0.0.0.0 --port 8000 \
-    --workers "${WEB_CONCURRENCY:-2}" --no-access-log
+    --workers "${WEB_CONCURRENCY:-4}" --no-access-log

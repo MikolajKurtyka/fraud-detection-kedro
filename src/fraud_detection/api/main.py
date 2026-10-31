@@ -6,7 +6,12 @@ concrete version the alias points to. The registered model is the full inference
 the model as a list of dicts, which takes its NumPy fast path (~2 ms per row instead of ~150 ms
 through pandas; same scores).
 
+Scaling: run several worker processes (``--workers`` / ``WEB_CONCURRENCY``); scoring is CPU-bound,
+so threads or async alone do not add throughput. Optional micro-batching of ``/predict``
+(``MICROBATCH_WAIT_MS`` > 0, off by default) scores concurrent requests in one model call.
+
 Run locally:  uv run uvicorn fraud_detection.api.main:app --reload
+              make api-prod WORKERS=8                       (several workers, no reload)
 """
 
 import json
@@ -17,13 +22,16 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request, Response
 from prometheus_client import Counter, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
+from starlette.concurrency import run_in_threadpool
 
+from .microbatch import MicroBatcher
 from .schemas import Health, Liveness, Prediction, Transaction, TransactionBatch
 
 logging.basicConfig(
@@ -35,6 +43,7 @@ prediction_logger = logging.getLogger("fraud_detection.api.predictions")
 
 DEFAULT_MODEL_URI = "models:/fraud-detection@champion"
 DEFAULT_THRESHOLD = 0.5
+DEFAULT_MICROBATCH_MAX_SIZE = 64
 ALIAS_URI = re.compile(r"^models:/(?P<name>[^/@]+)@(?P<alias>[^/@]+)$")
 VERSION_URI = re.compile(r"^models:/[^/@]+/(?P<version>\d+)$")
 
@@ -118,7 +127,21 @@ async def lifespan(app: FastAPI):
         state.load_error = f"{type(exc).__name__}: {exc}"
         logger.warning("Could not load model %s: %s", state.model_uri, exc)
     app.state.service = state
-    yield
+
+    batcher = None
+    wait_ms = float(os.getenv("MICROBATCH_WAIT_MS", "0"))
+    if wait_ms > 0:
+        max_size = int(os.getenv("MICROBATCH_MAX_SIZE", str(DEFAULT_MICROBATCH_MAX_SIZE)))
+        batcher = MicroBatcher(partial(_score_items, state), wait_ms, max_size)
+        batcher.start()
+        logger.info("Micro-batching on: wait %.1f ms, max %d per batch", wait_ms, max_size)
+    app.state.batcher = batcher
+    try:
+        yield
+    finally:
+        app.state.batcher = None
+        if batcher is not None:
+            await batcher.stop()
 
 
 app = FastAPI(title="Fraud Detection API", version="0.2.0", lifespan=lifespan)
@@ -190,8 +213,8 @@ def health(request: Request) -> Health:
     return _health(_service(request), "ok")
 
 
-def _score(request: Request, txs: list[Transaction]) -> list[Prediction]:
-    state = _service(request)
+def _model_scores(state: ServiceState, txs: list[Transaction]) -> np.ndarray:
+    """One model call for all transactions; errors as the HTTP errors the API returns."""
     model = state.model
     if model is None:
         raise HTTPException(
@@ -209,8 +232,39 @@ def _score(request: Request, txs: list[Transaction]) -> list[Prediction]:
     if len(probas) != len(txs):
         logger.error("Model returned %d scores for %d rows", len(probas), len(txs))
         raise HTTPException(status_code=500, detail="Prediction failed.")
+    return probas
 
-    request_id = getattr(request.state, "request_id", None)
+
+def _score(request: Request, txs: list[Transaction]) -> list[Prediction]:
+    state = _service(request)
+    probas = _model_scores(state, txs)
+    return _predictions(state, txs, probas, getattr(request.state, "request_id", None))
+
+
+def _score_items(
+    state: ServiceState, items: list[tuple[Transaction, str | None]]
+) -> list[Prediction | HTTPException]:
+    """Micro-batch scoring: (transaction, request id) pairs from different requests -> one
+    result per pair. If the combined call rejects the input, each transaction is scored alone,
+    so only the bad one gets its 422."""
+    txs = [tx for tx, _ in items]
+    try:
+        probas = _model_scores(state, txs)
+    except HTTPException as exc:
+        if exc.status_code != 422 or len(items) == 1:
+            return [exc] * len(items)
+        return [result for item in items for result in _score_items(state, [item])]
+    return [
+        _predictions(state, [tx], probas[i : i + 1], request_id)[0]
+        for i, (tx, request_id) in enumerate(items)
+    ]
+
+
+def _predictions(
+    state: ServiceState, txs: list[Transaction], probas: np.ndarray, request_id: str | None
+) -> list[Prediction]:
+    """Scores -> responses, with the metrics and one prediction log line per transaction."""
+    model = state.model
     log_predictions = prediction_logger.isEnabledFor(logging.INFO)
     predictions = []
     for tx, proba in zip(txs, probas.tolist(), strict=True):
@@ -244,8 +298,13 @@ def _score(request: Request, txs: list[Transaction]) -> list[Prediction]:
 
 
 @app.post("/predict", response_model=Prediction)
-def predict(tx: Transaction, request: Request) -> Prediction:
-    return _score(request, [tx])[0]
+async def predict(tx: Transaction, request: Request) -> Prediction:
+    """Score one transaction: alone in a worker thread, or, with micro-batching on, together
+    with the other transactions arriving within ``MICROBATCH_WAIT_MS``."""
+    batcher: MicroBatcher | None = getattr(request.app.state, "batcher", None)
+    if batcher is None:
+        return (await run_in_threadpool(_score, request, [tx]))[0]
+    return await batcher.submit((tx, getattr(request.state, "request_id", None)))
 
 
 @app.post("/predict/batch", response_model=list[Prediction])
