@@ -144,6 +144,9 @@ class FraudModel:
                 n_estimators=n_estimators,
                 early_stopping_rounds=stopping_rounds,
                 eval_metric="auc",
+                # Total gain, as LightGBM: the default (mean gain per split) ranks rarely
+                # used columns with a few large splits above the features the model relies on
+                importance_type="total_gain",
                 enable_categorical=True,
                 device=opts["device"],
                 **params,
