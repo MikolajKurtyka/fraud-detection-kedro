@@ -15,12 +15,15 @@ dependencies = [
     "numpy>=1.26",
     "pandera>=0.20",
     "scikit-learn>=1.5",
-    "lightgbm>=4.3",
+    "lightgbm>=4.7",
+    "xgboost>=3.0",
+    "catboost>=1.2",
     "optuna>=4.0",
     "shap>=0.46",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
+    "prometheus-fastapi-instrumentator>=8.1.0",
 ]
 
 [dependency-groups]
@@ -61,3 +64,6 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.kedro_telemetry]
+project_id = "0b578d2e142d4d3d8972475d82aa7b4c"
