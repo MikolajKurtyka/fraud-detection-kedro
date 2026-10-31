@@ -11,7 +11,7 @@ For every model it records valid ROC-AUC / PR-AUC, tree count, pickle size, fit 
 three serving timings:
 
 - ``model p50/p99``: one-row ``FraudModel.predict_proba`` (the model alone)
-- ``e2e p50/p99``:   one raw row through ``InferenceBundle`` (features + model, as the API)
+- ``e2e p50/p99``:   one raw row through ``InferenceBundle.predict_records`` (as the API)
 - ``batch rows/s``:  ``predict_proba`` on the whole valid set
 
 Writes ``data/08_reporting/feature_size_study_{model}.{csv,md,png}`` per model, and
@@ -118,7 +118,11 @@ def main() -> None:
     )
 
     raw = load_raw_sample(args.e2e_rows)
-    raw_rows = [raw.iloc[[i]] for i in range(len(raw))]
+    # One-row requests as the API passes them to the model: a list with one dict, nulls left out
+    raw_rows = [
+        [{k: v for k, v in r.items() if not pd.isna(v)}]
+        for r in raw.astype(object).to_dict("records")
+    ]
     valid_rows = [X_valid.iloc[[i]] for i in range(args.latency_rows)]
 
     for model_type in args.models:
@@ -152,7 +156,7 @@ def main() -> None:
                     target=target,
                 )
                 model_times = time_single_rows(model.predict_proba, valid_rows)
-                e2e_times = time_single_rows(bundle.predict_proba, raw_rows)
+                e2e_times = time_single_rows(bundle.predict_records, raw_rows)
 
                 row = {
                     "config": config,
