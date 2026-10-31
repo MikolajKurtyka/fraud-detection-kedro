@@ -1,0 +1,12 @@
+serving:
+  # Registry entry the API loads (MODEL_URI=models:/fraud-detection@champion).
+  registered_model_name: fraud-detection
+  alias: champion
+
+  # Decision threshold stored with the model, taken from its valid evaluation:
+  # at_fpr_threshold flags ~1% of legitimate transactions (evaluation.target_fpr),
+  # best_f1_threshold maximises F1, fixed_threshold is evaluation.fixed_threshold.
+  threshold_metric: at_fpr_threshold
+
+  # The alias moves to a new version only if it beats the current champion on this valid metric.
+  promotion_metric: pr_auc

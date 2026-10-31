@@ -17,3 +17,135 @@
   metadata:
     kedro-viz:
       layer: intermediate
+
+# ---------- 03_primary: time split + column filter fitted on train ----------
+# prm_train = earlier days of int_train, prm_valid = later days, prm_test = Kaggle test
+"prm_{split}":
+  type: pandas.ParquetDataset
+  filepath: data/03_primary/{split}.parquet
+  metadata:
+    kedro-viz:
+      layer: primary
+
+# Fitted artifact: which columns were dropped and why. Reused at inference time.
+column_filter:
+  type: json.JSONDataset
+  filepath: data/03_primary/column_filter.json
+  save_args:
+    indent: 2
+  metadata:
+    kedro-viz:
+      layer: primary
+
+# ---------- 04_feature: engineered features, encoders fitted on train ----------
+# Fitted artifact: group stats, frequencies, category encodings, feature list. Reused at inference.
+feature_encoders:
+  type: pickle.PickleDataset
+  filepath: data/04_feature/feature_encoders.pkl
+  metadata:
+    kedro-viz:
+      layer: feature
+
+"feat_{split}":
+  type: pandas.ParquetDataset
+  filepath: data/04_feature/{split}.parquet
+  metadata:
+    kedro-viz:
+      layer: feature
+
+# ---------- 05_model_input: ID + target (if labelled) + model features ----------
+"mdl_in_{split}":
+  type: pandas.ParquetDataset
+  filepath: data/05_model_input/{split}.parquet
+  metadata:
+    kedro-viz:
+      layer: model_input
+
+# ---------- 06_models / 08_reporting: one set per model (see MODEL_TYPES in training/model.py) ----------
+# Trained on train only, early-stopped on valid. All valid metrics come from this model.
+"{model}.model":
+  type: pickle.PickleDataset
+  filepath: data/06_models/{model}.pkl
+  metadata:
+    kedro-viz:
+      layer: models
+
+# Refitted on train + valid for the test submission (the same object as {model}.model when refit is off)
+"{model}.final_model":
+  type: pickle.PickleDataset
+  filepath: data/06_models/{model}_final.pkl
+  metadata:
+    kedro-viz:
+      layer: models
+
+"{model}.cv_metrics":
+  type: json.JSONDataset
+  filepath: data/08_reporting/{model}_cv_metrics.json
+  save_args:
+    indent: 2
+  metadata:
+    kedro-viz:
+      layer: reporting
+
+"{model}.best_params":
+  type: json.JSONDataset
+  filepath: data/06_models/{model}_best_params.json
+  save_args:
+    indent: 2
+  metadata:
+    kedro-viz:
+      layer: models
+
+"{model}.metrics":
+  type: json.JSONDataset
+  filepath: data/08_reporting/{model}_metrics.json
+  save_args:
+    indent: 2
+  metadata:
+    kedro-viz:
+      layer: reporting
+
+"{model}.evaluation":
+  type: json.JSONDataset
+  filepath: data/08_reporting/{model}_evaluation.json
+  save_args:
+    indent: 2
+  metadata:
+    kedro-viz:
+      layer: reporting
+
+"{model}.evaluation_curves":
+  type: matplotlib.MatplotlibDataset
+  filepath: data/08_reporting/{model}_curves.png
+  save_args:
+    dpi: 120
+  metadata:
+    kedro-viz:
+      layer: reporting
+
+# ---------- 07_model_output: Kaggle submissions (one per model, plus the boosting blend) ----------
+"{model}.submission":
+  type: pandas.CSVDataset
+  filepath: data/07_model_output/submission_{model}.csv
+  save_args:
+    index: false
+  metadata:
+    kedro-viz:
+      layer: model_output
+
+"{model}.feature_importance":
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/{model}_feature_importance.csv
+  metadata:
+    kedro-viz:
+      layer: reporting
+
+# ---------- serving: what the serving pipeline registered in MLflow (version, threshold, promoted) ----------
+serving_registration:
+  type: json.JSONDataset
+  filepath: data/08_reporting/serving_registration.json
+  save_args:
+    indent: 2
+  metadata:
+    kedro-viz:
+      layer: reporting

@@ -6,5 +6,10 @@ server:
 tracking:
   experiment:
     name: fraud-detection
+    create_experiment_kwargs:
+      # MLflow 3 UI: show the classic runs table (metrics, params, compare) instead of
+      # the GenAI traces view. Applied when the experiment is first created.
+      tags:
+        mlflow.experimentKind: custom_model_development
   params:
     long_params_strategy: truncate
