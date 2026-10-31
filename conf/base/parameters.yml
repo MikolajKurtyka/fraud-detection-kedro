@@ -1,0 +1,3 @@
+# Shared parameters. Pipeline-specific ones live in parameters_<pipeline>.yml.
+random_state: 42
+target: isFraud

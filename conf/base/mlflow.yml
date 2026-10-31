@@ -1,0 +1,10 @@
+# kedro-mlflow configuration. Defaults to a local SQLite store (./mlflow.db, artifacts in ./mlruns);
+# set MLFLOW_TRACKING_URI (e.g. http://localhost:5000 from docker compose) to use the server.
+server:
+  mlflow_tracking_uri: ${oc.env:MLFLOW_TRACKING_URI,"sqlite:///mlflow.db"}
+
+tracking:
+  experiment:
+    name: fraud-detection
+  params:
+    long_params_strategy: truncate

@@ -1,0 +1,19 @@
+# Data catalog -- every dataset the pipelines read or write.
+# Layers follow the Kedro data engineering convention (01_raw ... 08_reporting).
+
+# ---------- 01_raw: Kaggle files, never modified (see scripts/download_data.py) ----------
+# Dataset factory: matches raw_train_transaction, raw_test_identity, ...
+"raw_{split}_{table}":
+  type: pandas.CSVDataset
+  filepath: data/01_raw/{split}_{table}.csv
+  metadata:
+    kedro-viz:
+      layer: raw
+
+# ---------- 02_intermediate: joined, typed, compact ----------
+"int_{split}":
+  type: pandas.ParquetDataset
+  filepath: data/02_intermediate/{split}.parquet
+  metadata:
+    kedro-viz:
+      layer: intermediate

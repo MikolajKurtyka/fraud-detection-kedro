@@ -1,0 +1,3 @@
+data_ingestion:
+  join_key: TransactionID
+  downcast_numerics: true
