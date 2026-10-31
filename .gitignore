@@ -35,3 +35,6 @@ access_token
 .ipynb_checkpoints/
 .DS_Store
 Thumbs.db
+
+# Prometheus multiprocess metrics of `make api-prod`
+.prometheus/

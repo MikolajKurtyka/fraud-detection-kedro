@@ -1,9 +1,11 @@
-URL ?= http://localhost:8000
+URL ?= http://127.0.0.1:8000
 REQUESTS ?= 1 10 1000 10000
 BATCHES ?= 1 10 100 1000
 DURATION ?= 60
+CLIENTS ?= 1
+WORKERS ?= 4
 
-.PHONY: help setup data ingest features train train-fast baselines evaluate register compare feature-study run viz mlflow api loadtest test lint format docker-up docker-down clean
+.PHONY: help setup data ingest features train train-fast baselines evaluate register compare feature-study run viz mlflow api api-prod loadtest test lint format docker-up docker-down clean
 
 help:  ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -50,11 +52,17 @@ viz:  ## Open the pipeline graph (kedro-viz)
 mlflow:  ## Local MLflow UI (sqlite:///mlflow.db)
 	uv run mlflow ui --backend-store-uri sqlite:///mlflow.db --port 5000
 
-api:  ## Scoring API with auto-reload
+api:  ## Scoring API with auto-reload (one worker, for development)
 	uv run uvicorn fraud_detection.api.main:app --reload
 
-loadtest:  ## Open-loop load test of a running API (URL, REQUESTS per minute, BATCHES sizes, DURATION s)
-	uv run python scripts/loadtest.py --url $(URL) --requests $(REQUESTS) --batch-sizes $(BATCHES) --duration $(DURATION)
+api-prod:  ## Scoring API with WORKERS processes, as in Docker (MICROBATCH_WAIT_MS=2 turns on micro-batching)
+	rm -rf .prometheus && mkdir -p .prometheus
+	PROMETHEUS_MULTIPROC_DIR=.prometheus OMP_NUM_THREADS=1 uv run uvicorn fraud_detection.api.main:app \
+		--host 127.0.0.1 --port 8000 --workers $(WORKERS) --no-access-log
+
+loadtest:  ## Open-loop load test of a running API (URL, REQUESTS per minute, BATCHES sizes, DURATION s, CLIENTS processes)
+	uv run python scripts/loadtest.py --url $(URL) --requests $(REQUESTS) --batch-sizes $(BATCHES) \
+		--duration $(DURATION) --clients $(CLIENTS)
 
 test:  ## Run tests with coverage
 	uv run pytest --cov=fraud_detection --cov-report=term-missing

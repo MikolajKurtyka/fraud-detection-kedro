@@ -132,3 +132,26 @@ def test_api_errors_are_counted(rows):
 
     result = asyncio.run(run())
     assert result.ok == 0 and result.errors == {"HTTP 503": 4}
+
+
+@pytest.mark.parametrize(("n", "clients"), [(10, 3), (1, 4), (10000, 4), (7, 7)])
+def test_client_shares_cover_the_schedule_once(n, clients):
+    shares = loadtest.client_shares(n, clients)
+    assert sum(n_k for n_k, _ in shares) == n
+    assert [k for _, k in shares] == list(range(min(n, clients)))
+    # Client k sends schedule slots k, k + clients, ...: every slot exactly once
+    slots = sorted(k + i * clients for n_k, k in shares for i in range(n_k))
+    assert slots == list(range(n))
+
+
+def test_results_from_client_processes_merge():
+    a = loadtest.ScenarioResult(6, 1, 60.0, sent=6, ok=5, latencies_ms=[1.0] * 5, elapsed=60.0)
+    a.errors["HTTP 500"] += 1
+    b = loadtest.ScenarioResult(4, 1, 60.0, sent=3, ok=3, dropped=1, latencies_ms=[3.0] * 3)
+    b.elapsed = 61.0
+    merged = loadtest.ScenarioResult.merge([a, b])
+    assert (merged.requests, merged.sent, merged.ok, merged.dropped) == (10, 9, 8, 1)
+    assert merged.errors == {"HTTP 500": 1}
+    assert merged.elapsed == 61.0
+    assert sorted(merged.latencies_ms) == [1.0] * 5 + [3.0] * 3
+    assert merged.summary()["requests_per_min"] == 10

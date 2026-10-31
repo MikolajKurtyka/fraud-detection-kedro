@@ -10,12 +10,19 @@ transactions per request. Payloads are real raw rows from data/01_raw (transacti
 nulls left out), as a client would send them; synthetic rows if the raw files are missing.
 
 If more than --max-in-flight requests are waiting, new ones are dropped and counted, so an
-overloaded API cannot exhaust the client. The p99 < 50 ms budget is checked for B = 1.
-Writes data/08_reporting/loadtest.{csv,md}.
+overloaded API cannot exhaust the client. Idle connections are kept open longer than the gap
+between requests, so slow scenarios do not pay a new connection each time. Use 127.0.0.1, not
+localhost: on Windows a new connection to localhost tries IPv6 first and costs ~2 s.
+The p99 < 50 ms budget is checked for B = 1. Writes data/08_reporting/{--name}.{csv,md}.
 
     uv run python scripts/loadtest.py                                  # full grid, ~12 min
     uv run python scripts/loadtest.py --requests 1000 --batch-sizes 1  # one scenario
     uv run python scripts/loadtest.py --duration 10                    # same counts in 10 s
+    uv run python scripts/loadtest.py --clients 4                      # 4 client processes
+
+One asyncio client process tops out around 150 requests per second; above that the client,
+not the API, sets the latency. --clients N splits each scenario over N processes
+(--max-in-flight applies per process).
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ import math
 import random
 import time
 from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -112,6 +120,20 @@ class ScenarioResult:
     server_ms: list[float] = field(default_factory=list)
     elapsed: float = 0.0
 
+    @classmethod
+    def merge(cls, parts: list[ScenarioResult]) -> ScenarioResult:
+        """One result from the shares several client processes sent."""
+        out = cls(sum(p.requests for p in parts), parts[0].batch_size, parts[0].duration)
+        for p in parts:
+            out.sent += p.sent
+            out.ok += p.ok
+            out.dropped += p.dropped
+            out.errors.update(p.errors)
+            out.latencies_ms += p.latencies_ms
+            out.server_ms += p.server_ms
+        out.elapsed = max(p.elapsed for p in parts)
+        return out
+
     def summary(self) -> dict:
         lat = self.latencies_ms
         p99 = percentile(lat, 99)
@@ -145,8 +167,12 @@ async def run_scenario(
     bodies: list[bytes],
     duration: float = 60.0,
     max_in_flight: int = 256,
+    start_offset: float = 0.0,
 ) -> ScenarioResult:
-    """Send ``n_requests`` evenly over ``duration`` seconds without waiting for answers."""
+    """Send ``n_requests`` evenly over ``duration`` seconds without waiting for answers.
+
+    ``start_offset`` shifts the schedule, so client processes sharing a scenario interleave.
+    """
     path = "/predict" if batch_size == 1 else "/predict/batch"
     result = ScenarioResult(n_requests, batch_size, duration)
     in_flight: set[asyncio.Task] = set()
@@ -170,7 +196,7 @@ async def run_scenario(
     interval = duration / n_requests
     start = loop.time()
     for i in range(n_requests):
-        delay = start + i * interval - loop.time()
+        delay = start + start_offset + i * interval - loop.time()
         if delay > 0:
             await asyncio.sleep(delay)
         if len(in_flight) >= max_in_flight:
@@ -185,6 +211,53 @@ async def run_scenario(
     return result
 
 
+def client_shares(n_requests: int, clients: int) -> list[tuple[int, float]]:
+    """Split a scenario over client processes: (requests, offset in schedule intervals).
+
+    Client k sends requests k, k + clients, k + 2 * clients, ... of the combined schedule, so
+    together they keep the same even spacing.
+    """
+    shares = []
+    for k in range(min(clients, n_requests)):
+        n_k = len(range(k, n_requests, clients))
+        shares.append((n_k, k))
+    return shares
+
+
+# One client process: rows are sent once per process (pool initializer), not per scenario
+_ROWS: list[dict] = []
+
+
+def _init_client_process(rows: list[dict]) -> None:
+    _ROWS[:] = rows
+
+
+def _client_process(
+    url: str,
+    timeout: float,
+    n_requests: int,
+    batch_size: int,
+    duration: float,
+    max_in_flight: int,
+    start_offset: float,
+) -> ScenarioResult:
+    bodies = make_bodies(_ROWS, batch_size, n_bodies=_n_bodies(len(_ROWS), batch_size))
+
+    async def run() -> ScenarioResult:
+        limits = httpx.Limits(max_connections=max_in_flight, keepalive_expiry=duration + 5)
+        async with httpx.AsyncClient(base_url=url, timeout=timeout, limits=limits) as client:
+            return await run_scenario(
+                client, n_requests, batch_size, bodies, duration, max_in_flight, start_offset
+            )
+
+    return asyncio.run(run())
+
+
+def _n_bodies(n_rows: int, batch_size: int) -> int:
+    """Distinct bodies so every request is not the same transaction; fewer for big batches."""
+    return max(2, min(50, n_rows // batch_size))
+
+
 async def run_grid(
     client: httpx.AsyncClient,
     requests: list[int],
@@ -193,14 +266,38 @@ async def run_grid(
     duration: float = 60.0,
     max_in_flight: int = 256,
     log=print,
+    pool: ProcessPoolExecutor | None = None,
+    clients: int = 1,
 ) -> list[dict]:
+    """Run every (requests, batch size) scenario; with ``pool``, each one is split over
+    ``clients`` processes (one asyncio client each) and the results merged."""
     summaries = []
+    loop = asyncio.get_running_loop()
     for batch_size in batch_sizes:
-        # Distinct bodies so every request is not the same transaction; fewer for big batches
-        bodies = make_bodies(rows, batch_size, n_bodies=max(2, min(50, len(rows) // batch_size)))
+        bodies = make_bodies(rows, batch_size, n_bodies=_n_bodies(len(rows), batch_size))
         for n in requests:
             log(f"-> {n} requests x {batch_size} rows over {duration:.0f} s ...")
-            result = await run_scenario(client, n, batch_size, bodies, duration, max_in_flight)
+            if pool is None or clients == 1:
+                result = await run_scenario(client, n, batch_size, bodies, duration, max_in_flight)
+            else:
+                interval = duration / n
+                parts = await asyncio.gather(
+                    *(
+                        loop.run_in_executor(
+                            pool,
+                            _client_process,
+                            str(client.base_url),
+                            client.timeout.read,
+                            n_k,
+                            batch_size,
+                            duration,
+                            max_in_flight,
+                            k * interval,
+                        )
+                        for n_k, k in client_shares(n, clients)
+                    )
+                )
+                result = ScenarioResult.merge(parts)
             summary = result.summary()
             log(
                 f"   ok={summary['ok']}/{n} errors={summary['errors']} "
@@ -232,39 +329,59 @@ def to_markdown(table: pd.DataFrame) -> str:
 def write_report(summaries: list[dict], args: argparse.Namespace) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     table = pd.DataFrame(summaries)
-    table.to_csv(REPORT_DIR / "loadtest.csv", index=False)
+    table.to_csv(REPORT_DIR / f"{args.name}.csv", index=False)
     header = (
         f"# Load test\n\nAPI: `{args.url}`, each scenario spread over {args.duration:.0f} s, "
-        f"max {args.max_in_flight} requests in flight. Budget: p99 < {BUDGET_P99_MS:.0f} ms "
-        "for single transactions. Latency is client-side and includes queueing.\n\n"
+        f"{args.clients} client process(es), max {args.max_in_flight} requests in flight each. "
+        f"Budget: p99 < {BUDGET_P99_MS:.0f} ms for single transactions. "
+        "Latency is client-side and includes queueing.\n\n"
     )
-    (REPORT_DIR / "loadtest.md").write_text(header + to_markdown(table), encoding="utf-8")
+    (REPORT_DIR / f"{args.name}.md").write_text(header + to_markdown(table), encoding="utf-8")
     print(table.drop(columns="error_kinds").to_string(index=False))
-    print(f"\nWrote {REPORT_DIR / 'loadtest.csv'} and loadtest.md")
+    print(f"\nWrote {REPORT_DIR / args.name}.csv and .md")
 
 
 async def main_async(args: argparse.Namespace) -> int:
     rows = load_rows(max(2 * max(args.batch_sizes), 100))
-    limits = httpx.Limits(max_connections=args.max_in_flight)
+    # Keep idle connections longer than the gap between requests (60 s at 1 request per minute)
+    limits = httpx.Limits(max_connections=args.max_in_flight, keepalive_expiry=args.duration + 5)
     async with httpx.AsyncClient(base_url=args.url, timeout=args.timeout, limits=limits) as client:
         if error := await check_ready(client, rows):
             print(f"API not ready at {args.url}: {error}")
             return 1
-        summaries = await run_grid(
-            client, args.requests, args.batch_sizes, rows, args.duration, args.max_in_flight
-        )
+        pool = None
+        if args.clients > 1:
+            pool = ProcessPoolExecutor(
+                args.clients, initializer=_init_client_process, initargs=(rows,)
+            )
+        try:
+            summaries = await run_grid(
+                client,
+                args.requests,
+                args.batch_sizes,
+                rows,
+                args.duration,
+                args.max_in_flight,
+                pool=pool,
+                clients=args.clients,
+            )
+        finally:
+            if pool is not None:
+                pool.shutdown()
     write_report(summaries, args)
     return 0 if all(s["budget"] != "FAIL" for s in summaries) else 1
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--url", default="http://localhost:8000")
+    parser.add_argument("--url", default="http://127.0.0.1:8000")
     parser.add_argument("--requests", type=int, nargs="+", default=[1, 10, 1000, 10000])
     parser.add_argument("--batch-sizes", type=int, nargs="+", default=[1, 10, 100, 1000])
     parser.add_argument("--duration", type=float, default=60.0, help="seconds per scenario")
-    parser.add_argument("--max-in-flight", type=int, default=256)
+    parser.add_argument("--max-in-flight", type=int, default=256, help="per client process")
+    parser.add_argument("--clients", type=int, default=1, help="client processes")
     parser.add_argument("--timeout", type=float, default=30.0, help="seconds per request")
+    parser.add_argument("--name", default="loadtest", help="report file name in 08_reporting")
     args = parser.parse_args()
     if max(args.batch_sizes) > MAX_BATCH_SIZE or min(args.batch_sizes) < 1:
         parser.error(f"batch sizes must be 1..{MAX_BATCH_SIZE}")
