@@ -38,7 +38,9 @@ services:
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MODEL_URI: ${MODEL_URI:-models:/fraud-detection@champion}
-      FRAUD_THRESHOLD: ${FRAUD_THRESHOLD:-0.5}
+      # empty = use the threshold stored with the model
+      FRAUD_THRESHOLD: ${FRAUD_THRESHOLD:-}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
     ports:
       - "8000:8000"
     depends_on:

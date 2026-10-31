@@ -19,8 +19,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
 WORKDIR /app
 COPY --from=builder --chown=app:app /app /app
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1
+# One BLAS/OpenMP thread per worker: single-row scoring gains nothing from more, and
+# several workers would otherwise oversubscribe the CPUs. Scale with WEB_CONCURRENCY.
+ENV OMP_NUM_THREADS=1 WEB_CONCURRENCY=2 PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus
 USER app
 EXPOSE 8000
+# Liveness only: the API stays up (and healthy) without a model; /health/ready says why.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
-CMD ["uvicorn", "fraud_detection.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"
+# Shell form so WEB_CONCURRENCY expands; the metrics dir is reset so /metrics aggregates
+# only the current workers. Request logging is done by the app middleware.
+CMD rm -rf "$PROMETHEUS_MULTIPROC_DIR" && mkdir -p "$PROMETHEUS_MULTIPROC_DIR" \
+    && exec uvicorn fraud_detection.api.main:app --host 0.0.0.0 --port 8000 \
+    --workers "${WEB_CONCURRENCY:-2}" --no-access-log
