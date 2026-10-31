@@ -1,0 +1,42 @@
+feature_engineering:
+  join_key: TransactionID
+  time_column: TransactionDT
+
+  # D_n are "days since X" and grow with time. D_n_norm = day - D_n is "the day X happened",
+  # stable over time. D9 is excluded: it is a fraction of a day, not a day count.
+  d_columns: [D1, D2, D3, D4, D5, D6, D7, D8, D10, D11, D12, D13, D14, D15]
+
+  # Split into parts: "mail.yahoo.com" -> mail / yahoo / com
+  email_columns: [P_emaildomain, R_emaildomain]
+
+  # Pseudo client ID: same card, same billing region, same "card first seen" day.
+  uid_columns: [card1, addr1, D1_norm]
+
+  # Group statistics, fitted on train. Groups with fewer rows than min_group_size get NaN
+  # (a mean over 1-2 rows is mostly the row itself).
+  # ratio: true -> value / stat (e.g. TransactionAmt_to_mean_card1); false -> stat itself.
+  min_group_size: 5
+  group_features:
+    - {value: TransactionAmt, by: card1, stats: [mean, std], ratio: true}
+    - {value: TransactionAmt, by: card4, stats: [mean, std], ratio: true}
+    - {value: id_02, by: card1, stats: [mean, std], ratio: true}
+    - {value: id_02, by: card4, stats: [mean, std], ratio: true}
+    - {value: D15, by: card1, stats: [mean, std], ratio: true}
+    - {value: D15, by: card4, stats: [mean, std], ratio: true}
+    - {value: D15, by: addr1, stats: [mean, std], ratio: true}
+    - {value: D15, by: addr2, stats: [mean, std], ratio: true}
+    - {value: TransactionAmt, by: uid, stats: [mean, std], ratio: false}
+    - {value: D15, by: uid, stats: [mean, std], ratio: false}
+
+  # Frequency encoding: share of train rows with this value (0 for values unseen in train).
+  frequency_columns:
+    [card1, card2, card3, card5, addr1, addr2, P_emaildomain, R_emaildomain,
+     DeviceInfo, id_30, id_31, id_33, uid]
+
+  # Categorical columns with <= this many train categories keep the category dtype
+  # (native handling in LightGBM / XGBoost / CatBoost). Larger ones become integer codes.
+  max_native_categories: 100
+
+  # Not used as model features. TransactionDT / day are pure time; raw D_n are replaced
+  # by D_n_norm; uid only feeds the group / frequency features above.
+  drop_columns: [TransactionDT, day, uid, D1, D2, D3, D4, D5, D6, D7, D8, D10, D11, D12, D13, D14, D15]
