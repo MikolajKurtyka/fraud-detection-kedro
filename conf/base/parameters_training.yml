@@ -1,0 +1,213 @@
+# One block per model. Each block is the `model_options` of that model's namespaced pipeline.
+#
+# Validation: train = earlier 80% of days, valid = later 20% (see data_cleaning). Early stopping
+# and Optuna both score on valid. No KFold: random folds put future transactions into
+# training and inflate the score on time-ordered fraud data.
+#
+# Tuning: n_trials > 0 runs an Optuna search over `search_space` (merged on top of `params`),
+# capped at timeout_minutes. Set n_trials: 0 to train once with `params`.
+# Override from the CLI, e.g.: kedro run --pipelines training_xgboost --params "xgboost.model_options.n_trials=50"
+#
+# device: LightGBM's pip build is CPU-only; XGBoost ("cuda") and CatBoost ("GPU") use the NVIDIA card.
+#
+# imbalance.method: none | class_weight | undersample
+#   class_weight -> each library's own setting (LightGBM / sklearn class_weight="balanced",
+#                   XGBoost scale_pos_weight = negatives / positives, CatBoost auto_class_weights).
+#   undersample  -> keep all fraud rows and `undersample_ratio` legit rows per fraud row, train
+#                   split only (valid always keeps the true distribution). Both push predicted
+#                   probabilities up, so thresholds move; ranking metrics are what to compare.
+#   e.g. --params "lightgbm.model_options.imbalance.method=class_weight"
+#
+# cv_folds: N > 0 adds expanding-window time-series CV over train + valid (mean +- std in
+#   {model}_cv_metrics.json and the MLflow run). Off by default: it multiplies training time.
+#
+# refit: true refits on train + valid for the Kaggle submission, with best_iteration x
+#   refit_iteration_multiplier trees (no data is left for early stopping). Valid metrics always
+#   come from the train-only model.
+
+lightgbm:
+  model_options:
+    model_type: lightgbm
+    device: cpu
+    n_estimators: 5000
+    early_stopping_rounds: 200
+    log_every: 500
+    tuning_metric: pr_auc
+    n_trials: 25
+    timeout_minutes: 60
+    imbalance:
+      method: none
+      undersample_ratio: 5
+    cv_folds: 0
+    refit: true
+    refit_iteration_multiplier: 1.2
+    params:
+      objective: binary
+      boosting_type: gbdt
+      num_leaves: 256
+      min_child_samples: 79
+      max_depth: 13
+      learning_rate: 0.03
+      subsample: 0.9
+      subsample_freq: 3
+      colsample_bytree: 0.9
+      reg_alpha: 0.3
+      reg_lambda: 0.3
+      random_state: 42
+      n_jobs: -1
+      verbosity: -1
+    search_space:
+      num_leaves: {type: int, low: 31, high: 512, log: true}
+      max_depth: {type: int, low: 6, high: 16}
+      min_child_samples: {type: int, low: 20, high: 300, log: true}
+      learning_rate: {type: float, low: 0.02, high: 0.1, log: true}
+      colsample_bytree: {type: float, low: 0.3, high: 1.0}
+      subsample: {type: float, low: 0.6, high: 1.0}
+      reg_alpha: {type: float, low: 0.001, high: 10.0, log: true}
+      reg_lambda: {type: float, low: 0.001, high: 10.0, log: true}
+
+xgboost:
+  model_options:
+    model_type: xgboost
+    device: cuda
+    n_estimators: 5000
+    early_stopping_rounds: 200
+    log_every: 500
+    tuning_metric: pr_auc
+    n_trials: 25
+    timeout_minutes: 60
+    imbalance:
+      method: none
+      undersample_ratio: 5
+    cv_folds: 0
+    refit: true
+    refit_iteration_multiplier: 1.2
+    params:
+      objective: "binary:logistic"
+      tree_method: hist
+      max_depth: 9
+      learning_rate: 0.03
+      subsample: 0.9
+      colsample_bytree: 0.5
+      min_child_weight: 1
+      reg_alpha: 0.3
+      reg_lambda: 1.0
+      max_cat_to_onehot: 1
+      max_bin: 256
+      random_state: 42
+    search_space:
+      max_depth: {type: int, low: 4, high: 14}
+      learning_rate: {type: float, low: 0.02, high: 0.1, log: true}
+      min_child_weight: {type: float, low: 0.5, high: 50.0, log: true}
+      subsample: {type: float, low: 0.6, high: 1.0}
+      colsample_bytree: {type: float, low: 0.3, high: 1.0}
+      reg_alpha: {type: float, low: 0.001, high: 10.0, log: true}
+      reg_lambda: {type: float, low: 0.01, high: 10.0, log: true}
+
+catboost:
+  model_options:
+    model_type: catboost
+    device: GPU
+    n_estimators: 5000
+    early_stopping_rounds: 200
+    log_every: 500
+    tuning_metric: pr_auc
+    n_trials: 25
+    timeout_minutes: 60
+    imbalance:
+      method: none
+      undersample_ratio: 5
+    cv_folds: 0
+    refit: true
+    refit_iteration_multiplier: 1.2
+    params:
+      depth: 8
+      learning_rate: 0.05
+      l2_leaf_reg: 3.0
+      border_count: 254
+      random_seed: 42
+      # AUC has no GPU implementation: every eval copies valid predictions to CPU. Default is
+      # every 5 iterations on GPU; every 50 cuts most of that cost (early stopping on a 50-step grid).
+      metric_period: 50
+    search_space:
+      depth: {type: int, low: 4, high: 10}
+      learning_rate: {type: float, low: 0.02, high: 0.15, log: true}
+      l2_leaf_reg: {type: float, low: 0.5, high: 30.0, log: true}
+      random_strength: {type: float, low: 0.1, high: 10.0, log: true}
+
+# ---------- Baselines (scikit-learn). Untuned by default; not part of the blend. ----------
+
+# Logistic regression: median imputation + missing indicators, standard scaling, one-hot for
+# native categorical columns (categories with fewer than one_hot_min_frequency train rows are
+# grouped). High-cardinality columns arrive as integer codes and are treated as numbers.
+logreg:
+  model_options:
+    model_type: logreg
+    tuning_metric: pr_auc
+    n_trials: 0
+    timeout_minutes: 30
+    one_hot_min_frequency: 100
+    imbalance:
+      method: class_weight
+      undersample_ratio: 5
+    cv_folds: 0
+    refit: true
+    refit_iteration_multiplier: 1.2
+    params:
+      C: 0.1
+      max_iter: 1000
+      random_state: 42
+    search_space:
+      C: {type: float, low: 0.001, high: 10.0, log: true}
+
+# Random forest: native NaN support (sklearn >= 1.4), category columns as integer codes.
+random_forest:
+  model_options:
+    model_type: random_forest
+    tuning_metric: pr_auc
+    n_trials: 0
+    timeout_minutes: 60
+    imbalance:
+      method: none
+      undersample_ratio: 5
+    cv_folds: 0
+    refit: true
+    refit_iteration_multiplier: 1.2
+    params:
+      n_estimators: 300
+      max_features: sqrt
+      min_samples_leaf: 50
+      max_samples: 0.5
+      n_jobs: -1
+      random_state: 42
+    search_space:
+      min_samples_leaf: {type: int, low: 5, high: 300, log: true}
+      max_features: {type: float, low: 0.02, high: 0.3, log: true}
+
+# scikit-learn's histogram gradient boosting: native NaN and category support, CPU only.
+# A boosting reference without LightGBM / XGBoost / CatBoost's extras.
+hist_gb:
+  model_options:
+    model_type: hist_gb
+    n_estimators: 2000  # max_iter
+    early_stopping_rounds: 50
+    tuning_metric: pr_auc
+    n_trials: 0
+    timeout_minutes: 60
+    imbalance:
+      method: none
+      undersample_ratio: 5
+    cv_folds: 0
+    refit: true
+    refit_iteration_multiplier: 1.2
+    params:
+      learning_rate: 0.05
+      max_leaf_nodes: 63
+      min_samples_leaf: 100
+      l2_regularization: 1.0
+      random_state: 42
+    search_space:
+      learning_rate: {type: float, low: 0.02, high: 0.2, log: true}
+      max_leaf_nodes: {type: int, low: 15, high: 255, log: true}
+      min_samples_leaf: {type: int, low: 20, high: 500, log: true}
+      l2_regularization: {type: float, low: 0.001, high: 10.0, log: true}

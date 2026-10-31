@@ -1,0 +1,10 @@
+evaluation:
+  # Precision / recall / F1 are reported at a fixed threshold, at the threshold that maximises
+  # F1 on valid, and at a fixed false-positive rate (how much fraud is caught when only
+  # 1% of legitimate transactions are flagged).
+  # The best-F1 threshold is picked on valid itself, so its numbers are slightly optimistic.
+  fixed_threshold: 0.5
+  target_fpr: 0.01
+
+# Kaggle submissions: one per model, plus a rank-average blend of all models in the pipeline
+# (rank average ignores the different probability scales of the three libraries).
