@@ -1,0 +1,74 @@
+# 8. Model Card: Fraud Detection (IEEE-CIS)
+
+[← 7. Serving API](07_serving_api.md) · [Table of contents](01_introduction.md#table-of-contents)
+
+*Sections marked TBD are completed once the `evaluation` pipeline is implemented.*
+
+## Model Details
+
+- **Task**: binary classification, the probability that a card-not-present transaction is fraudulent
+- **Algorithms**: LightGBM, XGBoost and CatBoost, plus logistic regression, random forest and scikit-learn HistGradientBoosting as baselines, all trained on the same features and compared. Hyperparameter tuning with Optuna (PR-AUC) is built in but hasn't been run yet. LightGBM is currently the best
+- **Input**: raw transaction + identity columns, turned into 395 features by `InferenceBundle` (see [5. Pipelines](05_pipelines.md#feature_engineering))
+- **Variants**: `{model}.pkl` (train only, the one with validated metrics) and `{model}_final.pkl` (refitted on train + valid, used for the Kaggle submissions)
+- **Version**: will be tracked in the MLflow registry as `fraud-detection`, with the served version carrying the `champion` alias (TBD, see [7. Serving API](07_serving_api.md#how-a-model-reaches-the-api))
+- **Owner**: Mikolaj Kurtyka
+
+## Intended Use
+
+- **Primary use**: a real-time risk score that routes transactions to approve / manual review / decline
+- **Out of scope**: credit decisions, judging individual customers' intent, data from other payment providers without retraining
+
+## Training Data
+
+- IEEE-CIS Fraud Detection (Vesta): 590,540 labelled e-commerce transactions over ~182 days
+- Positive rate ~3.5%; identity information is present for ~24% of transactions
+- Most columns are anonymised (`V*`, `C*`, `D*`, `M*`, `id_*`), which limits domain interpretation
+- Train split: days 1–140 (472,006 rows, 3.51% fraud). Validation split: days 141–182 (118,534 rows, 3.44% fraud)
+
+## Evaluation
+
+- **Split**: time-based (train on earlier days, validate on later days). A random split would leak future fraud patterns
+- **Metrics now**: PR-AUC (main), ROC-AUC, train–valid gap; precision / recall / F1 / FPR at 0.5, at the best-F1 threshold and at 1% FPR; PR and ROC curves
+- **Metrics planned**: expected cost per 1k transactions
+- **Threshold (planned)**: chosen to minimise `FN × TransactionAmt + FP × review_cost`. Until then, the API uses `FRAUD_THRESHOLD`, or the threshold stored with the model, or 0.5
+
+**Results**: base parameters (Optuna tuning not run yet), validation on days 141–182:
+
+| Model | ROC-AUC | PR-AUC | Recall @ 1% FPR | Best F1 (threshold) | Train ROC-AUC | Gap |
+|---|---|---|---|---|---|---|
+| LightGBM | 0.9315 | 0.6137 | 0.537 | 0.596 (0.36) | 0.9991 | 0.068 |
+| XGBoost | 0.9292 | 0.6117 | 0.531 | 0.589 (0.26) | 0.9962 | 0.067 |
+| HistGB (baseline) | 0.9197 | 0.5910 | 0.524 | 0.583 (0.33) | 0.9917 | 0.072 |
+| CatBoost | 0.9056 | 0.5449 | 0.467 | 0.548 (0.37) | 0.9708 | 0.065 |
+| Random forest (baseline) | 0.8884 | 0.4482 | 0.387 | 0.465 (0.25) | 0.9520 | 0.064 |
+| Logistic regression (baseline) | 0.8361 | 0.1958 | 0.017 | 0.340 (0.83) | 0.8895 | 0.053 |
+
+In plain terms: with LightGBM, flagging 1 in 100 legitimate transactions catches about 54% of
+fraud. At its best-F1 threshold, 73% of flagged transactions are fraud and 50% of fraud is caught.
+
+These scores are slightly optimistic: early stopping picked the number of trees on the same
+validation split, and the best-F1 threshold was chosen on it too (see
+[6. Modeling approach](06_modeling_approach.md#known-limitations)). Kaggle submissions
+(`data/07_model_output/`) have been written but not uploaded, so there's no test-set score yet.
+
+## Explainability
+
+- Now: feature importance per model (`data/08_reporting/{model}_feature_importance.csv`, also logged to MLflow): gain for boosting, impurity for random forest, permutation on valid for logistic regression and HistGB
+- Monitoring: the API logs every prediction as JSON and exposes a probability histogram on `/metrics`, both inputs for drift checks
+- Planned global: SHAP feature importance, logged to MLflow per run
+- Planned local: SHAP values per prediction (an API option)
+
+## Limitations and Risks
+
+- Fraud patterns drift, so the model needs monitoring and periodic retraining
+- The train–valid gap (~0.07 ROC-AUC) suggests overfitting and/or remaining drift
+- The client UID is an approximation built from card and address fields; mistakes in it can merge different clients, and clients not seen in train get no aggregate features
+- Anonymised features make it hard to rule out proxy variables for protected attributes
+
+## Fairness Considerations
+
+- No protected attributes are available in the data, so a direct fairness audit isn't possible
+- Planned: compare error rates across available segments (device type, email domain, product code) to detect uneven false-alarm rates
+
+---
+[← 7. Serving API](07_serving_api.md) · [Back to 1. Introduction](01_introduction.md)
