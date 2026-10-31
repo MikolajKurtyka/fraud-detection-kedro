@@ -20,6 +20,9 @@ mlruns/
 mlartifacts/
 mlflow.db
 .viz/
+catboost_info/
+logs/*
+!logs/.gitkeep
 
 # Secrets / env
 .env

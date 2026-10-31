@@ -1,0 +1,43 @@
+# Project logging, picked up automatically by Kedro (override with KEDRO_LOGGING_CONFIG).
+# Console: rich output for interactive runs. Files: plain text under logs/ for later inspection.
+version: 1
+
+disable_existing_loggers: False
+
+formatters:
+  simple:
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+handlers:
+  rich:
+    class: kedro.logging.RichHandler
+    rich_tracebacks: True
+
+  info_file_handler:
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: simple
+    filename: logs/info.log
+    maxBytes: 10485760 # 10MB
+    backupCount: 5
+    encoding: utf8
+    delay: True
+
+  error_file_handler:
+    class: logging.handlers.RotatingFileHandler
+    level: WARNING
+    formatter: simple
+    filename: logs/errors.log
+    maxBytes: 10485760 # 10MB
+    backupCount: 5
+    encoding: utf8
+    delay: True
+
+loggers:
+  kedro:
+    level: INFO
+  fraud_detection:
+    level: INFO
+
+root:
+  handlers: [rich, info_file_handler, error_file_handler]
