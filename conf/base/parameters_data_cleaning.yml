@@ -1,0 +1,35 @@
+data_cleaning:
+  join_key: TransactionID
+
+  # Time-based split of int_train: the first `train_fraction` of days -> train, the rest -> valid.
+  # Split on whole days so one day never ends up in both sets.
+  time_column: TransactionDT
+  train_fraction: 0.8
+
+  # Column filter, fitted on the train split only and saved to column_filter.json.
+  # 0.99 instead of 0.9: at 0.9 the top-value rule removes rare-but-predictive columns
+  # (e.g. C3, D7, dist2, most id_18-id_27) -- it would even remove isFraud (96.5% zeros).
+  null_threshold: 0.99       # drop if share of nulls > threshold
+  top_value_threshold: 0.99  # drop if the most common value (incl. null) covers > threshold
+
+  # V columns come in blocks with identical null counts. Within each block, of every pair
+  # with |corr| > threshold keep the column with more unique values.
+  v_column_pattern: "^V\\d+$"
+  v_correlation_threshold: 0.95
+
+  # Never dropped. The target (shared `target` parameter) is always protected too.
+  # Includes every raw column the feature_engineering pipeline uses.
+  protected_columns:
+    - TransactionID
+    - TransactionDT
+    - TransactionAmt
+    - has_identity
+    - card1
+    - card4
+    - addr1
+    - addr2
+    - D1
+    - D15
+    - id_02
+    - P_emaildomain
+    - R_emaildomain

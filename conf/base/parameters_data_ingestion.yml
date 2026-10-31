@@ -1,3 +1,23 @@
 data_ingestion:
+  # ID column: present in both tables of both splits, used as the join key.
+  # The target column comes from the shared `target` parameter and is optional
+  # (present in train, absent in test), so the same pipeline runs on both splits.
   join_key: TransactionID
-  downcast_numerics: true
+
+  # Column types per raw table. "name{a..b}" expands to a numbered range,
+  # zero-padded if `a` is ("id_{01..11}" -> id_01 ... id_11).
+  # Every column in the file must be listed here (besides join_key / target),
+  # otherwise the pipeline fails -- this catches schema drift between splits.
+  schema:
+    transaction:
+      categorical: [ProductCD, "card{1..6}", addr1, addr2, P_emaildomain, R_emaildomain, "M{1..9}"]
+      numerical: [TransactionDT, TransactionAmt, dist1, dist2, "C{1..14}", "D{1..15}", "V{1..339}"]
+    identity:
+      categorical: [DeviceType, DeviceInfo, "id_{12..38}"]
+      numerical: ["id_{01..11}"]
+
+  # Storage dtypes. float32 halves memory; overrides keep exact values where it matters.
+  numerical_dtype: float32
+  numerical_dtype_overrides:
+    TransactionDT: int64     # test reaches ~34M seconds, beyond float32's exact-integer range (16.7M)
+    TransactionAmt: float64  # keep cents exact (float32 turns 0.251 into 0.25099999)
