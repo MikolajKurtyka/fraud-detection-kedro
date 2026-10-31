@@ -118,8 +118,10 @@ any identity column is set) unless sent.
 | `MODEL_URI` | `models:/fraud-detection@champion` | Alias, version (`models:/fraud-detection/3`) or `runs:/<id>/...`; an alias is resolved to a version at startup |
 | `FRAUD_THRESHOLD` | unset | Overrides the threshold stored with the model |
 | `MLFLOW_TRACKING_URI` | — (compose: `http://mlflow:5000`, local: `sqlite:///mlflow.db`) | Where the registry lives |
-| `WEB_CONCURRENCY` | `2` | uvicorn workers (Docker) |
-| `OMP_NUM_THREADS` | `1` (Docker) | One thread per worker; scale with workers |
+| `WEB_CONCURRENCY` | `4` (Docker) | uvicorn worker processes; about one per core given to the container. `make api-prod WORKERS=n` locally |
+| `OMP_NUM_THREADS` | `1` (Docker, `api-prod`) | One thread per worker; scale with workers |
+| `MICROBATCH_WAIT_MS` | `0` (off) | > 0 turns on micro-batching of `/predict`: wait up to this long to score concurrent requests together (see [Scaling](#scaling)) |
+| `MICROBATCH_MAX_SIZE` | `64` | Most transactions per micro-batch |
 | `LOG_LEVEL` | `INFO` | `WARNING` silences per-request / per-prediction logs |
 
 ## Running it
@@ -127,9 +129,12 @@ any identity column is set) unless sent.
 ```bash
 make register                                                     # register + maybe promote
 MLFLOW_TRACKING_URI=sqlite:///mlflow.db make api                  # http://localhost:8000/docs
+MLFLOW_TRACKING_URI=sqlite:///mlflow.db make api-prod WORKERS=8   # several workers, as in Docker
+MICROBATCH_WAIT_MS=2 make api-prod                                # ... with micro-batching on
 make docker-up                                                    # Postgres + MLflow + API
-make loadtest URL=http://localhost:8000                           # full grid below, ~12 min
+make loadtest                                                     # full grid below, ~15 min
 make loadtest REQUESTS=1000 BATCHES=1                             # one scenario
+make loadtest REQUESTS=10000 BATCHES=1 CLIENTS=4                  # 4 client processes
 ```
 
 ## Load test
@@ -147,20 +152,95 @@ which waits for each answer, would hide that). B = 1 goes to `/predict`, B > 1 t
 - Report: `data/08_reporting/loadtest.{csv,md}`: sent / ok / errors / dropped, achieved req/s
   and rows/s, client p50/p95/p99/max, server time (`X-Process-Time-Ms`), ms per row. Budget
   p99 < 50 ms is checked for B = 1; the exit code is 1 if a single-transaction scenario fails it.
+- `--clients N` splits each scenario over N client processes (interleaved schedules, results
+  merged). One asyncio client process tops out around 150 requests per second, so above that a
+  single client measures itself, not the API.
 
 `tests/api/test_loadtest.py` runs the same code in-process (ASGI transport, fake model) on a
 scaled-down grid, checks that every generated body validates against `Transaction` /
-`TransactionBatch`, and that overload drops requests instead of queueing them.
+`TransactionBatch`, that overload drops requests instead of queueing them, and that client
+shares cover the schedule exactly once and merge correctly.
 
 ## Latency
 
-Single-row latency is dominated by pandas per-column overhead: ~400 columns pass through several
-pandas operations, and LightGBM converts the 395-column frame (~23 ms), while evaluating the 531
-trees takes ~0.3 ms. Measured locally, one worker: p50 ≈ 225 ms per transaction (on a busy
-machine). This is above the 50 ms target; see the open options in the README / issue tracker:
-fewer features, a row-oriented fast path verified by the parity test, or passing numpy to
-LightGBM. Use `/predict/batch` for bulk scoring: 1000 rows take about as long as a few single
-requests.
+With the pandas path, one row took ~150–225 ms: ~400 columns went through thousands of pandas
+calls at ~0.1–1 ms each, while the 531 trees take ~0.3 ms. The API now uses the NumPy fast path
+(see [Parity](#how-a-model-reaches-the-api)): **~2 ms per row in-process** (features ~0.5 ms,
+model ~0.3 ms, the rest the numerical cast), 1000 rows ~110 ms.
+
+Load test, one uvicorn worker, LightGBM champion v2, client and API on the same Windows laptop
+(`data/08_reporting/loadtest.md`; the 1 and 10 per minute rows are from the rerun with connection
+reuse, `loadtest_low_rate.md`):
+
+| Requests / min | Rows / request | Client p50 / p99 | Server p50 | Result |
+|---|---|---|---|---|
+| 1–10 | 1 | 10 / 15 ms | ~4 ms | **pass** (p99 < 50 ms) |
+| 1000 | 1 | 11 / 13 ms | 5 ms | **pass** |
+| 10000 | 1 | 3.1 s / 18 s | 34 ms | overload, but mostly of the single client process (see [Scaling](#scaling)) |
+| 1000 | 10 | 15 / 49 ms | 9 ms | ok, 167 rows/s |
+| 1000 | 100 | 48 / 407 ms | 39 ms | ok, 1,667 rows/s, queueing in the tail |
+| 10 | 1000 | 230 / 343 ms | ~200 ms | ok |
+| 1000–10000 | 100–1000 | timeouts | — | overload (17k–170k rows/s asked) |
+
+Reading it:
+
+- **Single transactions meet the budget** at 1000 requests per minute on one worker. At 10000
+  per minute (167 req/s) the run above was limited by its single client process; see
+  [Scaling](#scaling) for the runs with several clients and workers.
+- **Batches are the cheap way to throughput**: ~0.2–0.4 ms per row at 100–1000 rows, ~3–5k rows/s
+  per worker. A 1000-row batch spends ~110 ms scoring and the rest parsing JSON, validating with
+  pydantic and writing 1000 prediction log lines (`LOG_LEVEL=WARNING` turns those off).
+- The top-right of the grid (1000+ batches of 100–1000 rows per minute) is 10–100× one worker's
+  capacity; it ends in client timeouts, and the API keeps working through the abandoned backlog
+  for a few minutes. That is a sizing limit, not a bug.
+- On Windows, point the client at `127.0.0.1`, not `localhost`: each new connection to
+  `localhost` tried IPv6 first and cost ~2 s here, which made the first run of the 10 per minute
+  scenarios look like 266 ms.
+
+## Scaling
+
+Scoring is CPU work, and Python runs CPU work in one thread at a time per process, so **async or
+threads alone do not add throughput**. The endpoints are plain `def` (FastAPI runs them in a
+thread pool); `async` matters on the client side, which is why the load test is async.
+
+Two levers, both configuration only:
+
+1. **Worker processes** (the main one): `WEB_CONCURRENCY` in Docker (default 4), `--workers` /
+   `make api-prod WORKERS=n` locally; about one per core. Each worker loads its own copy of the
+   model (a few hundred MB). Beyond one machine: more containers behind a load balancer, scaled on
+   CPU. With several workers, Prometheus needs `PROMETHEUS_MULTIPROC_DIR` so `/metrics` adds up
+   all workers (set in Docker and `api-prod`).
+2. **Micro-batching** (optional, off by default): `MICROBATCH_WAIT_MS` > 0. `/predict` hands its
+   transaction to a `MicroBatcher` (`api/microbatch.py`) that collects concurrent requests for up
+   to that many ms (or `MICROBATCH_MAX_SIZE`) and scores them in one model call; each request
+   still gets its own response. If the combined call rejects the input, each transaction is
+   rescored alone, so only the bad one gets its 422. Tests: `tests/api/test_microbatch.py`.
+
+Measured on the development laptop (32 logical cores, Windows), 10000 single transactions per
+minute, client processes on the same machine:
+
+| Workers | Micro-batching | Clients | Result over repeated runs |
+|---|---|---|---|
+| 1 | off | 1 | client-bound: ~56 req/s, most requests dropped |
+| 1 | off | 4 | at the limit: 1 of 5 runs passed (p99 27 ms), the others collapsed into multi-second tails |
+| 1 | on, 2 ms | 4 | 0 of 2 runs passed |
+| 4 | off | 4 | 1 of 3 runs answered everything (p99 59 ms), 2 collapsed |
+| 8 | off | 2 | passed: 10000/10000 answered, p99 14–16 ms |
+| 8 | off | 1 | 1000 batches × 100 rows per minute: p99 55 ms (one worker: 407 ms) |
+
+What this says, and what it does not:
+
+- More workers clearly help, and 8 workers handled 10000 single requests per minute within
+  budget. One worker is saturated at that rate.
+- The runs are noisy: when a run collapses, the server's own time stays at 5–9 ms while
+  connections queue and are refused before reaching the app. Clients, API workers and other
+  processes share one Windows machine, and Windows spreads connections over uvicorn workers less
+  evenly than Linux. Measure capacity on the deployment platform (Linux containers, client on
+  another machine) before sizing production.
+- Micro-batching did not help here: per request, most CPU goes to HTTP, JSON, validation and
+  logging, which batching the model call does not reduce, and the wait adds latency. It is kept
+  as an option for setups where the model call dominates (bigger models, more features, or
+  slower hardware); turn it on only if a load test shows a gain.
 
 ---
 [← 6. Modeling approach](06_modeling_approach.md) · [Next: 8. Model card →](08_model_card.md)

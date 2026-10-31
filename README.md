@@ -30,6 +30,8 @@ and a containerised FastAPI scoring service.
 | Run history table from MLflow (`scripts/compare_runs.py`) | Done |
 | `evaluation`: cost-based threshold, SHAP, champion promotion | Planned |
 | Inference wrapper for the API (`InferenceBundle` + `FraudPyfunc` in `src/fraud_detection/inference.py`) | Done |
+| NumPy fast path for serving (`fast_inference.py`, ~2 ms per row, bit-identical to the pandas path) | Done |
+| Open-loop async load test, 1–10000 requests/min × 1–1000 rows (`make loadtest`) | Done |
 | Logging the bundle to the MLflow registry + `@champion` alias | Planned |
 | `data_validation` (pandera schemas) | Planned |
 

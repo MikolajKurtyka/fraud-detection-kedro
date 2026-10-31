@@ -100,8 +100,10 @@ Output: `data/08_reporting/feature_size_study_{model}.{csv,md,png}`.
 
 So far only one configuration has been run (LightGBM, compact, top 10 features): valid PR-AUC
 0.464 vs 0.614 for the full model; model latency p50 3.7 ms; **end-to-end latency p50 576 ms**.
-End-to-end time is dominated by feature computation, not the model, which matters for the
-API's 50 ms p99 budget. Run the full study before choosing a feature count.
+That 576 ms was the pandas feature path, not the model; the API now uses the NumPy fast path
+(~2 ms per row with all 395 features, see [7. Serving API](07_serving_api.md#latency)), and the
+study times that path. Feature count is therefore an accuracy / maintenance choice, not a latency
+one. Run the full study before choosing it.
 
 ## 3. Change over time (drift)
 

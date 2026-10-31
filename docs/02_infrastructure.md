@@ -93,7 +93,8 @@ fraud-detection-kedro/
 │   │   ├── feature_engineering/
 │   │   ├── training/                  # + model.py: FraudModel wrapper
 │   │   └── evaluation/                # precision / recall, curves, Kaggle submissions
-│   ├── api/                           # main.py (FastAPI), schemas.py (pydantic)
+│   ├── api/                           # main.py (FastAPI), schemas.py (pydantic), microbatch.py (optional)
+│   ├── fast_inference.py              # RecordScorer: NumPy fast path for the API (same scores)
 │   ├── inference.py                   # InferenceBundle (raw rows → probability) + FraudPyfunc (MLflow)
 │   ├── keys.py                        # to_key(): stable string keys for categories
 │   ├── pipeline_registry.py           # which pipelines exist
@@ -289,8 +290,9 @@ against a remote MLflow → move `@champion` only if the challenger wins on the 
 | `make run` | `kedro run` | All pipelines (`__default__`) |
 | `make viz` | `kedro viz run` | Pipeline graph in the browser |
 | `make mlflow` | `mlflow ui …` | Local MLflow UI on :5000 |
-| `make api` | `uvicorn … --reload` | API with auto-reload |
-| `make loadtest` | `scripts/loadtest.py --url $(URL) --requests $(REQUESTS) --batch-sizes $(BATCHES) --duration $(DURATION)` | Open-loop load test of a running API: each of {1, 10, 1000, 10000} requests per minute x {1, 10, 100, 1000} transactions per request; report in `data/08_reporting/loadtest.{csv,md}` |
+| `make api` | `uvicorn … --reload` | API with auto-reload (one worker, development) |
+| `make api-prod` | `uvicorn … --workers $(WORKERS) --no-access-log` | API with several workers as in Docker (default 4); `MICROBATCH_WAIT_MS=2` turns on micro-batching |
+| `make loadtest` | `scripts/loadtest.py --url $(URL) --requests $(REQUESTS) --batch-sizes $(BATCHES) --duration $(DURATION) --clients $(CLIENTS)` | Open-loop load test of a running API: each of {1, 10, 1000, 10000} requests per minute x {1, 10, 100, 1000} transactions per request; report in `data/08_reporting/loadtest.{csv,md}` |
 | `make test` / `lint` / `format` | pytest / ruff | Quality checks |
 | `make docker-up` / `docker-down` | docker compose | Start or stop the serving stack |
 | `make clean` | `find data … -delete` | Remove generated data (keeps `01_raw`) |
