@@ -92,7 +92,8 @@ fraud-detection-kedro/
 │   │   ├── data_cleaning/
 │   │   ├── feature_engineering/
 │   │   ├── training/                  # + model.py: FraudModel wrapper
-│   │   └── evaluation/                # precision / recall, curves, Kaggle submissions
+│   │   ├── evaluation/                # precision / recall, curves, Kaggle submissions
+│   │   └── serving/                   # register the InferenceBundle in MLflow, move @champion
 │   ├── api/                           # main.py (FastAPI), schemas.py (pydantic), microbatch.py (optional)
 │   ├── fast_inference.py              # RecordScorer: NumPy fast path for the API (same scores)
 │   ├── inference.py                   # InferenceBundle (raw rows → probability) + FraudPyfunc (MLflow)

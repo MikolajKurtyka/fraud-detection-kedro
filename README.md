@@ -20,7 +20,7 @@ and a containerised FastAPI scoring service.
 |---|---|
 | Repo structure, setup scripts, Kaggle download with manifest | Done |
 | `data_ingestion` pipeline (typing per table, join, schema fix) | Done |
-| FastAPI service (`/predict`, `/predict/batch`, `/health/live`, `/health/ready`, Prometheus `/metrics`), Dockerfile, docker compose | Done (waits for a registered model) |
+| FastAPI service (`/predict`, `/predict/batch`, `/health/live`, `/health/ready`, Prometheus `/metrics`), Dockerfile, docker compose | Done |
 | CI (lint, tests, Kedro load check, Docker build) | Done |
 | `data_cleaning` (time split, column filter fitted on train) | Done |
 | `feature_engineering` (time features, client UID, aggregations, encodings) | Done |
@@ -28,11 +28,11 @@ and a containerised FastAPI scoring service.
 | `evaluation`: precision / recall / F1 at 3 thresholds, PR + ROC curves, logged into MLflow | Done |
 | `evaluation`: Kaggle submissions per model + rank-average blend | Done (files written, not uploaded yet) |
 | Run history table from MLflow (`scripts/compare_runs.py`) | Done |
-| `evaluation`: cost-based threshold, SHAP, champion promotion | Planned |
+| `evaluation`: cost-based threshold, SHAP | Planned |
 | Inference wrapper for the API (`InferenceBundle` + `FraudPyfunc` in `src/fraud_detection/inference.py`) | Done |
 | NumPy fast path for serving (`fast_inference.py`, ~2 ms per row, bit-identical to the pandas path) | Done |
 | Open-loop async load test, 1–10000 requests/min × 1–1000 rows (`make loadtest`) | Done |
-| Logging the bundle to the MLflow registry + `@champion` alias | Planned |
+| `serving`: register the bundle in the MLflow registry, move `@champion` only if PR-AUC improves (`make register`) | Done |
 | `data_validation` (pandera schemas) | Planned |
 
 ## Project Overview
@@ -91,11 +91,12 @@ GitHub Actions: lint → tests → Kedro load check → Docker image build
 | Pipeline | Input → Output | What it does |
 |---|---|---|
 | `data_ingestion` | `01_raw` → `02_intermediate` | Types each table against the schema in parameters (categorical / numerical, ID, optional target), fixes test column names (`id-01` → `id_01`), left-joins identity onto transactions, adds `has_identity` |
-| `data_validation` | `02_intermediate` → `08_reporting` | Checks schema, ranges and null rates with pandera; checks train/test column parity |
+| `data_validation` | `02_intermediate` → `08_reporting` | *Planned (empty):* schema, range and null-rate checks with pandera; train/test column parity |
 | `data_cleaning` | `02` → `03_primary` | Time split (earlier 80% of days = train, rest = valid); drops near-empty, near-constant and correlated V columns with a filter fitted on train |
 | `feature_engineering` | `03` → `04_feature` → `05_model_input` | Time features, normalized D columns, email parts, client UID proxy, group-ratio / frequency / UID aggregates and category encodings fitted on train |
 | `training` | `05` → `06_models` | LightGBM, XGBoost (GPU), CatBoost (GPU), each with Optuna tuning, early stopping on valid, one nested MLflow run per model |
-| `evaluation` | `06` → `08_reporting` | PR-AUC, recall at a fixed false-positive rate, cost-based threshold, SHAP, champion promotion |
+| `evaluation` | `06` → `08_reporting` | Precision / recall / F1 at 3 thresholds, PR + ROC curves, Kaggle submissions per model + blend (planned: cost-based threshold, SHAP) |
+| `serving` | `06` + fitted artifacts → MLflow registry | Wraps one model (LightGBM by default) with its column filter and encoders as an MLflow pyfunc, registers it as `fraud-detection`, moves `@champion` only if valid PR-AUC improves |
 
 **MLflow** (through `kedro-mlflow`) records parameters, metrics and artifacts for every `kedro run`
 and keeps models in the registry. The model that serves traffic carries the `champion` alias.

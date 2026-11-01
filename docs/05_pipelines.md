@@ -16,8 +16,10 @@ nodes to catalog datasets and parameters). `pipeline_registry.py` registers them
 | `feature_engineering` | Done | 10 | `kedro run --pipelines feature_engineering` |
 | `training` | Done | 24 (4 per model, 6 models) | `kedro run --pipelines training` (`make train`) |
 | `training_lightgbm` / `_xgboost` / `_catboost` / `_logreg` / `_random_forest` / `_hist_gb` | Done | 4 | One model only. Not part of `__default__` |
-| `evaluation` | Done (metrics, curves, submissions); cost threshold / SHAP / promotion planned | 13 (2 per model + blend of the 3 boosting models) | `kedro run --pipelines evaluation` (`make evaluate`) |
-| `__default__` | — | all of the above except `training_*` | `kedro run` (`make run`) |
+| `evaluation` | Done (metrics, curves, submissions); cost threshold / SHAP planned | 13 (2 per model + blend of the 3 boosting models) | `kedro run --pipelines evaluation` (`make evaluate`) |
+| `serving` | Done | 1 | `kedro run --pipelines serving` (`make register`) |
+| `serving_xgboost` / `_catboost` / ... | Done | 1 | Register another model type. Not part of `__default__` |
+| `__default__` | — | all of the above except `training_*` / `serving_*` | `kedro run` (`make run`) |
 
 Useful variations:
 
@@ -355,8 +357,8 @@ them the latest `stage = final` run of that model type is used.
 The best-F1 threshold is picked on valid itself, so its numbers are slightly optimistic.
 
 **Still planned:** a cost-based threshold (`Σ missed fraud × TransactionAmt + Σ false alarms ×
-review_cost`), SHAP importance, and registering the inference bundle in MLflow, moving
-`@champion` only when a challenger wins.
+review_cost`) and SHAP importance. Registering the model and moving `@champion` is done by the
+`serving` pipeline, see [7. Serving API](07_serving_api.md).
 
 ---
 
