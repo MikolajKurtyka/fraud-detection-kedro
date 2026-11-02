@@ -531,7 +531,7 @@ small "compact" trees. Valid PR-AUC, tuned params:
   (1.5–5 MB) for 0.01–0.04 less PR-AUC.
 - Serving speed is decided by the code path, not the feature count. On the API's NumPy fast path,
   LightGBM scores a raw row in **~2 ms (0.8 ms single-threaded)**. The other model types need a
-  pandas DataFrame and take 20–70 ms (`make serving-latency`).
+  pandas DataFrame and take ~20–65 ms (~20–40 ms single-threaded; `make serving-latency`).
 
 Details: [Modeling approach](docs/06_modeling_approach.md#how-many-features-are-needed) and
 [Serving API](docs/07_serving_api.md#latency-per-model-type).

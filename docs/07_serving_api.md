@@ -240,22 +240,22 @@ p50 in ms:
 
 | Model | Pandas path | NumPy fast path | Fast path, 1 thread | Model only, 1 thread |
 |---|---|---|---|---|
-| **LightGBM** | 170 | 1.9 | **0.8** | 7.5 |
-| CatBoost | 123 | 28 | 21 | 20 |
-| XGBoost | 174 | 50 | 21 | 13 |
-| HistGB | 210 | 73 | 32 | 17 |
-| Random forest | 191 | 65 | 41 | 23 |
-| Logistic regression | 377 | 131 | 42 | 37 |
+| **LightGBM** | 166 | 2.0 | **0.8** | 7.6 |
+| CatBoost | 110 | 19 | 18 | 12 |
+| XGBoost | 172 | 51 | 22 | 14 |
+| HistGB | 185 | 66 | 24 | 15 |
+| Random forest | 138 | 61 | 26 | 20 |
+| Logistic regression | 114 | 40 | 38 | 33 |
 
 - **LightGBM is the only model that stays NumPy end to end.** `RecordScorer` passes it the float
   matrix directly. Every other model type gets a pandas DataFrame with category dtypes rebuilt
-  from that matrix, and the rebuild plus the library's own DataFrame handling costs 10–40 ms.
-  That is also why LightGBM's "model only" time on a DataFrame (7.5 ms) is higher than its whole
+  from that matrix, and the rebuild plus the library's own DataFrame handling costs 10–35 ms.
+  That is also why LightGBM's "model only" time on a DataFrame (7.6 ms) is higher than its whole
   fast path.
 - **Threads slow down single rows.** With the default thread settings (`n_jobs=-1`, OpenMP), each
   call starts a thread pool for one row. One thread is 2–3× faster for XGBoost, HistGB and random
-  forest. CatBoost is the exception. The API does not set this yet: a single-row service should
-  score with one thread, and batch scoring can keep all cores.
+  forest; CatBoost and logistic regression barely change. The API does not set this yet: a
+  single-row service should score with one thread, and batch scoring can keep all cores.
 - **The number of features matters less than either.** On the
   [feature-count study](06_modeling_approach.md#how-many-features-are-needed), going from 395 to
   100 features roughly halves the DataFrame-path model time, but it does not touch the
