@@ -5,7 +5,7 @@ DURATION ?= 60
 CLIENTS ?= 1
 WORKERS ?= 4
 
-.PHONY: help setup data ingest features train train-fast baselines evaluate register compare feature-study run viz mlflow api api-prod loadtest test lint format docker-up docker-down clean
+.PHONY: help setup data ingest validate features train train-fast baselines evaluate register compare feature-study run viz mlflow api api-prod loadtest test lint format docker-up docker-down clean
 
 help:  ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -18,6 +18,9 @@ data:  ## Download competition data into data/01_raw
 
 ingest:  ## Run the data_ingestion pipeline
 	uv run kedro run --pipelines data_ingestion
+
+validate:  ## pandera checks on the ingested tables -> data/08_reporting/data_validation.json
+	uv run kedro run --pipelines data_validation
 
 features:  ## Run cleaning + feature engineering (02 -> 05)
 	uv run kedro run --pipelines data_cleaning,feature_engineering

@@ -18,6 +18,16 @@
     kedro-viz:
       layer: intermediate
 
+# Result of the pandera checks on int_train / int_test (written only when they pass)
+data_validation_report:
+  type: json.JSONDataset
+  filepath: data/08_reporting/data_validation.json
+  save_args:
+    indent: 2
+  metadata:
+    kedro-viz:
+      layer: reporting
+
 # ---------- 03_primary: time split + column filter fitted on train ----------
 # prm_train = earlier days of int_train, prm_valid = later days, prm_test = Kaggle test
 "prm_{split}":

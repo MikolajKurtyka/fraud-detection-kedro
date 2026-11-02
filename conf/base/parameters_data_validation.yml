@@ -1,0 +1,21 @@
+data_validation:
+  # Checks on int_train / int_test. Column types come from data_ingestion.schema.
+  time_column: TransactionDT
+
+  # Must never be null (every other column may be).
+  required_columns: [TransactionID, TransactionDT, TransactionAmt, ProductCD]
+
+  # Allowed values per numerical column: gt / ge / lt / le.
+  value_ranges:
+    TransactionDT: {ge: 0}
+    TransactionAmt: {gt: 0}
+
+  # Share of fraud in train. The Kaggle data has ~3.5%; far outside means a broken file or join.
+  fraud_rate_range: [0.01, 0.10]
+
+  # Largest allowed |null share in test - null share in train| per column.
+  # The Kaggle data reaches ~0.14 (some V and D blocks), so 0.25 flags only real breaks.
+  max_null_rate_diff: 0.25
+
+  # true: stop the run when a check fails. false: log a warning and continue.
+  fail_on_error: true
