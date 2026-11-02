@@ -46,12 +46,21 @@ def register_model(
         params["alias"],
         params["promotion_metric"],
     )
+    if params["threshold_metric"] not in evaluation:
+        raise KeyError(
+            f"{params['threshold_metric']!r} is not in the {model.model_type} evaluation; "
+            "re-run the evaluation pipeline (make evaluate) first"
+        )
     threshold = float(evaluation[params["threshold_metric"]])
     score = float(evaluation[metric])
+    # Expected cost per 1k transactions at the stored threshold, e.g. min_cost_cost_per_1k
+    cost_key = params["threshold_metric"].removesuffix("_threshold") + "_cost_per_1k"
+    cost = evaluation.get(cost_key)
     summary = {
         "model_type": model.model_type,
         "threshold_metric": params["threshold_metric"],
         "threshold": threshold,
+        "cost_per_1k": cost,
         metric: score,
         "registered_model_name": name,
         "version": None,
@@ -70,7 +79,14 @@ def register_model(
         feature_params=feature_params,
         target=target,
     )
-    metadata = {"model_type": model.model_type, "threshold": threshold, metric: score}
+    metadata = {
+        "model_type": model.model_type,
+        "threshold": threshold,
+        "threshold_metric": params["threshold_metric"],
+        metric: score,
+    }
+    if cost is not None:
+        metadata["cost_per_1k"] = cost
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "bundle.pkl"
         path.write_bytes(pickle.dumps(bundle))

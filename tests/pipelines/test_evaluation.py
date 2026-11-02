@@ -12,7 +12,8 @@ from fraud_detection.pipelines.training.model import BOOSTING_TYPES, MODEL_TYPES
 
 TARGET = "isFraud"
 KEY = "TransactionID"
-PARAMS = {"fixed_threshold": 0.5, "target_fpr": 0.01}
+COST = {"amount_column": "TransactionAmt", "review_cost": 5.0, "false_block_cost": 15.0}
+PARAMS = {"fixed_threshold": 0.5, "target_fpr": 0.01, "cost": COST}
 
 
 def _frame(n: int, seed: int) -> pd.DataFrame:
@@ -24,6 +25,7 @@ def _frame(n: int, seed: int) -> pd.DataFrame:
             TARGET: (signal + rng.normal(scale=0.5, size=n) > 1.2).astype("int8"),
             "signal": signal.astype("float32"),
             "noise": rng.normal(size=n).astype("float32"),
+            "TransactionAmt": rng.lognormal(4, 1, size=n),
         }
     )
 
@@ -45,7 +47,7 @@ def model_and_valid():
 def test_evaluate_model_metrics(model_and_valid):
     model, valid = model_and_valid
     metrics, figure = evaluate_model(model, valid, PARAMS, TARGET, KEY)
-    for prefix in ("fixed", "best_f1", "at_fpr"):
+    for prefix in ("fixed", "best_f1", "at_fpr", "min_cost"):
         assert 0 <= metrics[f"{prefix}_precision"] <= 1
         assert 0 <= metrics[f"{prefix}_recall"] <= 1
         counts = sum(metrics[f"{prefix}_{c}"] for c in ("tp", "fp", "fn", "tn"))
@@ -53,6 +55,31 @@ def test_evaluate_model_metrics(model_and_valid):
     assert metrics["at_fpr_fpr"] <= PARAMS["target_fpr"] + 1e-9
     assert metrics["best_f1_f1"] >= metrics["fixed_f1"] - 1e-9  # best F1 is the max over thresholds
     assert figure is not None
+
+
+def _brute_force_cost(y, proba, amount, threshold):
+    flagged = proba >= threshold
+    return (
+        amount[(y == 1) & ~flagged].sum()
+        + COST["review_cost"] * flagged.sum()
+        + COST["false_block_cost"] * (flagged & (y == 0)).sum()
+    )
+
+
+def test_min_cost_threshold_is_the_cheapest(model_and_valid):
+    model, valid = model_and_valid
+    metrics, _ = evaluate_model(model, valid, PARAMS, TARGET, KEY)
+    y, amount = valid[TARGET].to_numpy(), valid["TransactionAmt"].to_numpy()
+    proba = model.predict_proba(valid.drop(columns=[KEY, TARGET]))
+    per_1k = 1000 / len(valid)
+    best = _brute_force_cost(y, proba, amount, metrics["min_cost_threshold"]) * per_1k
+    assert metrics["min_cost_cost_per_1k"] == pytest.approx(best)
+    # No threshold, including "flag nothing" and "flag everything", is cheaper
+    for threshold in [*np.unique(proba), np.inf]:
+        assert _brute_force_cost(y, proba, amount, threshold) * per_1k >= best - 1e-6
+    assert best <= metrics["no_model_cost_per_1k"] + 1e-9
+    for prefix in ("fixed", "best_f1", "at_fpr"):
+        assert metrics[f"{prefix}_cost_per_1k"] >= best - 1e-6
 
 
 def test_predict_submission_format(model_and_valid):

@@ -1,10 +1,19 @@
 evaluation:
   # Precision / recall / F1 are reported at a fixed threshold, at the threshold that maximises
-  # F1 on valid, and at a fixed false-positive rate (how much fraud is caught when only
-  # 1% of legitimate transactions are flagged).
-  # The best-F1 threshold is picked on valid itself, so its numbers are slightly optimistic.
+  # F1 on valid, at a fixed false-positive rate (how much fraud is caught when only
+  # 1% of legitimate transactions are flagged), and at the threshold with the lowest cost.
+  # Thresholds picked on valid itself (best F1, min cost) give slightly optimistic numbers.
   fixed_threshold: 0.5
   target_fpr: 0.01
+
+  # Cost of a decision, per transaction (assumptions -- agree real figures with the business):
+  # a missed fraud costs its amount (chargeback), every flagged transaction costs a review or a
+  # step-up check, and a flagged good customer costs extra (support call, lost sale, churn).
+  # The min_cost threshold minimises the total on valid; the API uses it (serving.threshold_metric).
+  cost:
+    amount_column: TransactionAmt
+    review_cost: 5.0
+    false_block_cost: 15.0
 
 # Kaggle submissions: one per model, plus a rank-average blend of all models in the pipeline
 # (rank average ignores the different probability scales of the three libraries).
