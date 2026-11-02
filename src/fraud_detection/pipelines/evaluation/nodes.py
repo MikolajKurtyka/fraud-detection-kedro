@@ -253,6 +253,55 @@ def evaluate_model(
     return metrics, figure
 
 
+def explain_model(
+    model: FraudModel, valid: pd.DataFrame, params: dict, target: str, join_key: str
+) -> tuple[pd.DataFrame, plt.Figure]:
+    """Global SHAP importance on a sample of valid: mean |SHAP| per feature (log-odds).
+
+    Unlike gain, SHAP splits each prediction among the features additively, so the
+    numbers are comparable across LightGBM, XGBoost and CatBoost.
+    """
+    shap_params = params["shap"]
+    sample = valid.sample(
+        min(shap_params["sample_size"], len(valid)), random_state=shap_params["random_state"]
+    )
+    values = model.shap_values(sample.drop(columns=[join_key, target]))[:, :-1]
+    importance = (
+        pd.DataFrame(
+            {
+                "feature": model.feature_columns,
+                "mean_abs_shap": np.abs(values).mean(axis=0),
+                "mean_shap": values.mean(axis=0),
+            }
+        )
+        .sort_values("mean_abs_shap", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    top = importance.head(shap_params["top_n"]).iloc[::-1]
+    fig, ax = plt.subplots(figsize=(8, 0.3 * len(top) + 1.5))
+    ax.barh(top["feature"], top["mean_abs_shap"], color="#2563eb")
+    ax.set(
+        xlabel="mean |SHAP| (log-odds)",
+        title=f"{model.model_type}: top {len(top)} features on {len(sample)} valid rows",
+    )
+    fig.tight_layout()
+
+    run_id = _training_run_id(model) if mlflow.active_run() else None
+    if run_id is not None:
+        client = MlflowClient()
+        client.log_figure(run_id, fig, "shap_importance.png")
+        client.log_text(run_id, importance.to_csv(index=False), "shap_importance.csv")
+
+    logger.info(
+        "%s SHAP on %d valid rows, top 5: %s",
+        model.model_type,
+        len(sample),
+        ", ".join(f"{r.feature} {r.mean_abs_shap:.3f}" for r in importance.head(5).itertuples()),
+    )
+    return importance, fig
+
+
 def predict_submission(model: FraudModel, test: pd.DataFrame, join_key: str) -> pd.DataFrame:
     """Kaggle submission: TransactionID, isFraud probability for every test row."""
     proba = model.predict_proba(test.drop(columns=[join_key]))

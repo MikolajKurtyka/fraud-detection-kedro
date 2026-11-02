@@ -15,5 +15,12 @@ evaluation:
     review_cost: 5.0
     false_block_cost: 15.0
 
+  # Global SHAP importance (gradient-boosting models only): mean |SHAP| per feature on a random
+  # sample of valid. Exact TreeSHAP costs ~linear time in rows, so a sample is enough.
+  shap:
+    sample_size: 5000
+    random_state: 42
+    top_n: 25
+
 # Kaggle submissions: one per model, plus a rank-average blend of all models in the pipeline
 # (rank average ignores the different probability scales of the three libraries).

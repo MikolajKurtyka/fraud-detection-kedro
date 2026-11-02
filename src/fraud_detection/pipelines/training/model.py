@@ -270,6 +270,26 @@ class FraudModel:
             self.estimator.set_params(device="cpu")
         return self.estimator.predict_proba(X)[:, 1]
 
+    def shap_values(self, X: pd.DataFrame) -> np.ndarray:
+        """SHAP values in log-odds (rows x features, plus the base value as the last column).
+
+        Exact TreeSHAP from each library's own implementation, so no extra dependency and
+        no approximation. Only gradient-boosting models; the baselines are for comparison.
+        """
+        if self.model_type not in BOOSTING_TYPES:
+            raise ValueError(f"SHAP values are only computed for {BOOSTING_TYPES}")
+        X = self._prepare(X)
+        if self.model_type == "lightgbm":
+            return self.estimator.predict(X, pred_contrib=True)
+        if self.model_type == "xgboost":
+            self.estimator.set_params(device="cpu")
+            matrix = xgb.DMatrix(X, enable_categorical=True)
+            return self.estimator.get_booster().predict(
+                matrix, pred_contribs=True, iteration_range=(0, self.best_iteration)
+            )
+        pool = cb.Pool(X, cat_features=self.categorical_columns)
+        return self.estimator.get_feature_importance(pool, type="ShapValues")
+
     def feature_importance(self) -> pd.DataFrame | None:
         """Built-in importance (gain / impurity); None for models without one."""
         importances = getattr(self.estimator, "feature_importances_", None)

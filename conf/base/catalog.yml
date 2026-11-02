@@ -150,6 +150,25 @@ feature_encoders:
     kedro-viz:
       layer: reporting
 
+# Global SHAP importance on a sample of valid (gradient-boosting models only)
+"{model}.shap_importance":
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/{model}_shap_importance.csv
+  save_args:
+    index: false
+  metadata:
+    kedro-viz:
+      layer: reporting
+
+"{model}.shap_plot":
+  type: matplotlib.MatplotlibDataset
+  filepath: data/08_reporting/{model}_shap.png
+  save_args:
+    dpi: 120
+  metadata:
+    kedro-viz:
+      layer: reporting
+
 # ---------- serving: what the serving pipeline registered in MLflow (version, threshold, promoted) ----------
 serving_registration:
   type: json.JSONDataset

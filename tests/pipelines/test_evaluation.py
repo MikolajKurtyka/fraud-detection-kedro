@@ -5,6 +5,7 @@ import pytest
 from fraud_detection.pipelines.evaluation.nodes import (
     blend_submissions,
     evaluate_model,
+    explain_model,
     predict_submission,
 )
 from fraud_detection.pipelines.evaluation.pipeline import create_pipeline
@@ -13,7 +14,8 @@ from fraud_detection.pipelines.training.model import BOOSTING_TYPES, MODEL_TYPES
 TARGET = "isFraud"
 KEY = "TransactionID"
 COST = {"amount_column": "TransactionAmt", "review_cost": 5.0, "false_block_cost": 15.0}
-PARAMS = {"fixed_threshold": 0.5, "target_fpr": 0.01, "cost": COST}
+SHAP = {"sample_size": 200, "random_state": 0, "top_n": 3}
+PARAMS = {"fixed_threshold": 0.5, "target_fpr": 0.01, "cost": COST, "shap": SHAP}
 
 
 def _frame(n: int, seed: int) -> pd.DataFrame:
@@ -82,6 +84,39 @@ def test_min_cost_threshold_is_the_cheapest(model_and_valid):
         assert metrics[f"{prefix}_cost_per_1k"] >= best - 1e-6
 
 
+@pytest.mark.parametrize("model_type", BOOSTING_TYPES)
+def test_shap_values_add_up_to_the_prediction(model_type):
+    train, valid = _frame(600, 0), _frame(300, 1)
+    for frame in (train, valid):  # one categorical column, as in the real model input
+        frame["product"] = pd.Categorical(
+            np.where(frame["noise"] > 0, "W", "C"), categories=["C", "H", "W"]
+        )
+    device = "CPU" if model_type == "catboost" else "cpu"
+    options = {"n_estimators": 30, "early_stopping_rounds": 10, "log_every": 0, "device": device}
+    params = {"lightgbm": {"verbosity": -1, "min_child_samples": 5}}.get(model_type, {})
+    model = FraudModel(model_type, params, options)
+    model.fit(
+        train.drop(columns=[KEY, TARGET]),
+        train[TARGET],
+        valid.drop(columns=[KEY, TARGET]),
+        valid[TARGET],
+    )
+    X = valid.drop(columns=[KEY, TARGET])
+    values = model.shap_values(X)
+    assert values.shape == (len(X), len(model.feature_columns) + 1)
+    log_odds = values.sum(axis=1)
+    np.testing.assert_allclose(1 / (1 + np.exp(-log_odds)), model.predict_proba(X), atol=1e-5)
+
+
+def test_explain_model_ranks_the_signal_first(model_and_valid):
+    model, valid = model_and_valid
+    importance, figure = explain_model(model, valid, PARAMS, TARGET, KEY)
+    assert importance["feature"].iloc[0] == "signal"
+    assert set(importance["feature"]) == set(model.feature_columns)
+    assert importance["mean_abs_shap"].is_monotonic_decreasing
+    assert figure is not None
+
+
 def test_predict_submission_format(model_and_valid):
     model, valid = model_and_valid
     test = valid.drop(columns=TARGET)
@@ -111,3 +146,5 @@ def test_pipeline_blends_boosting_models_and_submits_final_model():
     assert sorted(blend.inputs) == sorted(f"{m}.submission" for m in BOOSTING_TYPES)
     submit = next(n for n in pipe.nodes if n.name == "lightgbm.predict_submission")
     assert "lightgbm.final_model" in submit.inputs
+    explained = {n.namespace for n in pipe.nodes if n.name.endswith(".explain_model")}
+    assert explained == set(BOOSTING_TYPES)
