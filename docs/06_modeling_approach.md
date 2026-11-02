@@ -61,8 +61,9 @@ flowchart TB
 | d. **Adversarial validation** | Label train = 0 and test = 1 (or early = 0, late = 1) and train a classifier. Its top features are the ones that *drift* → drop or transform them | 🔜 |
 | e. Importance-based pruning | **Permutation importance on valid**, or **null importance** (retrain with a shuffled target; keep features whose real importance clearly beats the shuffled distribution). Drop the bottom features and re-check valid PR-AUC | Partly: permutation importance exists (used for logreg / HistGB); `scripts/feature_size_study.py` retrains on the top-N features and measures the trade-off ([below](#how-many-features-are-needed)). An automatic pruning step is 🔜 |
 
-Careful with importance: for the boosting models, the importance saved in
-`{model}_feature_importance.csv` is **gain**-based (random forest: impurity-based; logistic
+Careful with importance: for LightGBM and XGBoost, the importance saved in
+`{model}_feature_importance.csv` is **total gain** (CatBoost: its default prediction-value
+change; random forest: impurity-based; logistic
 regression and HistGB have no built-in importance, so they get permutation importance on a
 20k-row sample of valid). Gain is biased toward high-cardinality and noisy features, and it is measured on
 *train*. Use it to explore, not to drop features. SHAP or permutation importance on valid is more
@@ -71,18 +72,24 @@ reliable.
 All thresholds live in `parameters_data_cleaning.yml`, so you can tune them like hyperparameters
 (e.g. try `v_correlation_threshold: 0.9`).
 
-### Current top features (gain importance)
+### Current top features (built-in importance)
 
 | Rank | LightGBM | XGBoost | CatBoost |
 |---|---|---|---|
 | 1 | V258 | V258 | uid_freq |
-| 2 | C1 | V257 | D1_norm |
-| 3 | C14 | V246 | C13 |
-| 4 | D1_norm | V201 | card1_freq |
-| 5 | D15_std_uid | V243 | TransactionAmt_mean_uid |
+| 2 | C1 | P_emaildomain | D1_norm |
+| 3 | C14 | C1 | C13 |
+| 4 | D1_norm | C14 | card1_freq |
+| 5 | D15_std_uid | D15_std_uid | TransactionAmt_mean_uid |
 
 The engineered client features (`uid_freq`, `D1_norm`, `*_uid` aggregates) rank near the top in
-LightGBM and CatBoost, which supports the client-level view described below.
+all three, which supports the client-level view described below.
+
+XGBoost's default importance is *mean* gain per split. That ranks raw `V` columns used in a few
+large splits at the top (V258, V257, V246, V201, V243), and its top 50 shared only 15 features with
+LightGBM's. The wrapper now asks for `total_gain`, as LightGBM reports. The two top-50 lists now
+share 42 features, and XGBoost trained on its own top 50 went from 0.470 to 0.601 valid PR-AUC
+(next section).
 
 ### How many features are needed?
 
@@ -96,14 +103,39 @@ importance and retrains the same model type on the top N (default N = all, 300, 
 - **end-to-end** latency: one raw row through `InferenceBundle`, the same path as the API, p50 and p99;
 - batch throughput in rows per second.
 
-Output: `data/08_reporting/feature_size_study_{model}.{csv,md,png}`.
+Output: `data/08_reporting/feature_size_study_{model}.{csv,md,png}`, plus
+`feature_size_study_all.png` with every model's tuned runs side by side. The whole study takes
+several hours on one laptop. CatBoost and HistGB are the slowest; use `--models` to run a subset.
 
-So far only one configuration has been run (LightGBM, compact, top 10 features): valid PR-AUC
-0.464 vs 0.614 for the full model; model latency p50 3.7 ms; **end-to-end latency p50 576 ms**.
-That 576 ms was the pandas feature path, not the model; the API now uses the NumPy fast path
-(~2 ms per row with all 395 features, see [7. Serving API](07_serving_api.md#latency)), and the
-study times that path. Feature count is therefore an accuracy / maintenance choice, not a latency
-one. Run the full study before choosing it.
+**Results** (valid PR-AUC, tuned params; all six models, run 31 Oct – 1 Nov 2026):
+
+| Model | 395 | 200 | 150 | 100 | 50 | 25 | 10 |
+|---|---|---|---|---|---|---|---|
+| XGBoost | 0.616 | **0.623** | 0.617 | 0.614 | 0.601 | 0.561 | 0.515 |
+| LightGBM | 0.613 | 0.616 | 0.615 | 0.611 | 0.601 | 0.559 | 0.509 |
+| HistGB | 0.591 | 0.613 | 0.605 | 0.597 | 0.593 | 0.549 | 0.509 |
+| CatBoost | 0.567 | 0.573 | 0.553 | 0.551 | 0.554 | 0.532 | 0.305 |
+| Random forest | 0.445 | 0.453 | 0.449 | 0.445 | 0.431 | 0.414 | 0.345 |
+| Logistic regression | 0.196 | 0.190 | 0.188 | 0.184 | 0.161 | 0.140 | 0.143 |
+
+- **The boosting models keep ~0.60 PR-AUC down to 50 features**, and most do best around 200.
+  Below 25 features every model loses clearly. Differences under ~0.005 are within the noise of
+  one holdout.
+- **Size depends on the tree settings, not the feature count.** Tuned models are 12–20 MB (random
+  forest ~68 MB) at any N. The compact params are 3–10× smaller for 0.01–0.04 less PR-AUC, e.g.
+  XGBoost compact on 200 features: 3.0 MB, 0.596; HistGB compact on 100: 1.5 MB, 0.587.
+- **The feature count barely changes serving latency.** The code path and the thread setting
+  matter much more (see [7. Serving API](07_serving_api.md#latency-per-model-type)). LightGBM
+  scores a raw row in under 1 ms with all 395 features.
+- The ranking comes from a model early-stopped on valid, so the top-N runs get a slight
+  optimistic edge.
+
+Feature count is therefore an accuracy / maintenance choice: the top 100–150 features keep the full
+model's accuracy with a third of the columns to compute, monitor and explain.
+
+The `e2e` columns in the per-model CSVs are not comparable across models: LightGBM was timed on the
+pandas path, XGBoost on the NumPy fast path. Use `scripts/serving_latency.py` for a like-for-like
+comparison.
 
 ## 3. Change over time (drift)
 
@@ -189,7 +221,7 @@ All values live in `conf/base/parameters_training.yml`, one block per model. Eac
 
 | Option | Value | What it does |
 |---|---|---|
-| `model_type` | `lightgbm` / `xgboost` / `catboost` | Which library `FraudModel` wraps |
+| `model_type` | `lightgbm` / `xgboost` / `catboost` / `logreg` / `random_forest` / `hist_gb` | Which library `FraudModel` wraps |
 | `device` | `cpu` / `cuda` / `GPU` | Where trees are built. LightGBM's pip build is CPU-only |
 | `n_estimators` | 5000 | Upper limit on the number of trees. Never reached in practice: early stopping ends sooner |
 | `early_stopping_rounds` | 200 | Stop when valid AUC has not improved for 200 trees; keep the best tree count (`best_iteration`) |
@@ -264,7 +296,8 @@ things to try, and the search spaces below include them.
 | `random_state` | 42 | — | Seed |
 
 Set by the wrapper, not in YAML: `enable_categorical=True` (use the pandas `category` columns
-directly), `eval_metric="auc"`, `device` from the run options.
+directly), `eval_metric="auc"`, `importance_type="total_gain"` (see
+[top features](#current-top-features-built-in-importance)), `device` from the run options.
 
 ### CatBoost
 
@@ -300,10 +333,21 @@ from tuning.
 
 ## Known limitations
 
-1. **Optimistic validation score.** Early stopping already picks the number of trees on the valid
-   split, and Optuna will also score on it once tuning runs. So the reported valid score is
-   slightly optimistic. Fix: a third, later holdout (e.g. the last
-   2–3 weeks) used only for the final report, or forward-chaining folds.
+1. **Optimistic validation score.** The valid split does five jobs: early stopping, Optuna
+   tuning, choosing the threshold, champion promotion, and the reported metrics. Each choice made
+   on it makes its score a little more optimistic, and CV reuses the parameters tuned on it.
+   Fix: a third, later holdout (e.g. the last 2–3 weeks) used only for the final report and the
+   promotion decision.
+
+   ```mermaid
+   flowchart LR
+       subgraph now["Today"]
+           A1["train<br/>days 1–140"] --> B1["valid days 141–182<br/>early stopping · tuning · threshold<br/>promotion · reported metrics"]
+       end
+       subgraph better["Proposed"]
+           A2["train"] --> B2["valid<br/>early stopping · tuning · threshold"] --> C2["holdout (last 2–3 weeks)<br/>reported metrics · promotion"]
+       end
+   ```
 2. **Train–valid gap of ~0.07 ROC-AUC** for all models (LightGBM train ROC-AUC 0.999). This
    suggests overfitting (256 leaves, depth 13) and/or remaining drift. Try stronger
    regularisation, plus funnel steps c–e.
@@ -319,6 +363,11 @@ from tuning.
    optimistic. A cost-based threshold should be chosen on one period and checked on a later one.
 7. **Encoders don't see clients that are new in valid or test.** Their UID stats are NaN, which
    is honest, but it means production performance depends on how often clients come back.
+8. **Champion and challenger are compared on stored scores.** `@champion` moves when the new
+   model's valid PR-AUC beats the PR-AUC stored with the current champion. That is a fair
+   comparison only while both were scored on the same validation days. The Kaggle data never
+   changes, so it holds today; once retraining sees new data (or `train_fraction` changes), score
+   the current champion on the new valid split before comparing.
 
 ---
 [← 5. Pipelines](05_pipelines.md) · [Next: 7. Serving API →](07_serving_api.md)

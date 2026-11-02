@@ -85,8 +85,8 @@ The key ideas:
 | Inference wrapper `InferenceBundle` (raw rows → probability with the pipeline's own node functions) + `FraudPyfunc` (MLflow pyfunc) | Done |
 | CI: lint, tests, Kedro load check, Docker build | Done |
 | `data_validation`: pandera schemas, train/test parity, stops the run on a failed check | Done |
-| `evaluation`: precision / recall / F1 at 3 thresholds, PR + ROC curves (logged into MLflow), Kaggle submission per model + blend | Done |
-| Scripts: run history from MLflow, feature-count study, API load test | Done |
+| `evaluation`: precision / recall / F1 at fixed, best-F1 and 1%-FPR thresholds, PR + ROC curves (logged into MLflow), Kaggle submission per model + blend | Done |
+| Scripts: run history from MLflow, feature-count study (all 6 models), per-model serving latency, API load test | Done |
 | `evaluation`: cost-based threshold (stored with the model, used by the API), global SHAP importance | Done |
 | Per-prediction SHAP explanations (`POST /explain`) | Done |
 | Weekly retraining workflow against a remote MLflow | Done; needs a hosted MLflow server and secrets |

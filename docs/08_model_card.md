@@ -2,15 +2,13 @@
 
 [← 7. Serving API](07_serving_api.md) · [Table of contents](01_introduction.md#table-of-contents)
 
-*Sections marked TBD are completed once the `evaluation` pipeline is implemented.*
-
 ## Model Details
 
 - **Task**: binary classification, the probability that a card-not-present transaction is fraudulent
 - **Algorithms**: LightGBM, XGBoost and CatBoost, plus logistic regression, random forest and scikit-learn HistGradientBoosting as baselines, all trained on the same features and compared. Hyperparameter tuning with Optuna (PR-AUC) is built in but hasn't been run yet. LightGBM is currently the best
 - **Input**: raw transaction + identity columns, turned into 395 features by `InferenceBundle` (see [5. Pipelines](05_pipelines.md#feature_engineering))
 - **Variants**: `{model}.pkl` (train only, the one with validated metrics) and `{model}_final.pkl` (refitted on train + valid, used for the Kaggle submissions)
-- **Version**: will be tracked in the MLflow registry as `fraud-detection`, with the served version carrying the `champion` alias (TBD, see [7. Serving API](07_serving_api.md#how-a-model-reaches-the-api))
+- **Version**: tracked in the MLflow registry as `fraud-detection`; the served version carries the `champion` alias and every API response names it (`model_version`). The registered artifact is the full inference bundle (column filter + feature encoders + LightGBM), with its threshold, cost per 1k, valid PR-AUC and training run ID as tags (see [7. Serving API](07_serving_api.md#how-a-model-reaches-the-api))
 - **Owner**: Mikolaj Kurtyka
 
 ## Intended Use
@@ -46,20 +44,21 @@ In plain terms: with LightGBM, flagging 1 in 100 legitimate transactions catches
 fraud. At its best-F1 threshold, 73% of flagged transactions are fraud and 50% of fraud is caught.
 
 These scores are slightly optimistic: early stopping picked the number of trees on the same
-validation split, and the best-F1 threshold was chosen on it too (see
+validation split, and the best-F1 and min-cost thresholds were chosen on it too (see
 [6. Modeling approach](06_modeling_approach.md#known-limitations)). Kaggle submissions
 (`data/07_model_output/`) have been written but not uploaded, so there's no test-set score yet.
 
 ## Explainability
 
-- Now: feature importance per model (`data/08_reporting/{model}_feature_importance.csv`, also logged to MLflow): gain for boosting, impurity for random forest, permutation on valid for logistic regression and HistGB
+- Built-in: feature importance per model (`data/08_reporting/{model}_feature_importance.csv`, also logged to MLflow): total gain for LightGBM and XGBoost, prediction-value change for CatBoost, impurity for random forest, permutation on valid for logistic regression and HistGB
 - Monitoring: the API logs every prediction as JSON and exposes a probability histogram on `/metrics`, both inputs for drift checks
 - Global: mean |SHAP| per feature on 5,000 valid rows for each boosting model (`data/08_reporting/{model}_shap_importance.csv`, also in MLflow). LightGBM's top features: C13, D1_norm, card1_freq, card6, D4_norm, TransactionAmt
 - Local: `POST /explain` returns the features that pushed one transaction's score up or down most (SHAP values in log-odds)
 
 ## Limitations and Risks
 
-- Fraud patterns drift, so the model needs monitoring and periodic retraining
+- Fraud patterns drift, so the model needs monitoring and periodic retraining (weekly workflow in place; feature drift monitoring is not)
+- The decision threshold rests on assumed costs ($5 review, $15 false block); with $50 per false block the optimum moves from 0.077 to ~0.28
 - The train–valid gap (~0.07 ROC-AUC) suggests overfitting and/or remaining drift
 - The client UID is an approximation built from card and address fields; mistakes in it can merge different clients, and clients not seen in train get no aggregate features
 - Anonymised features make it hard to rule out proxy variables for protected attributes

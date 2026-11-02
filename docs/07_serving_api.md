@@ -80,6 +80,38 @@ Errors: 503 when no model is loaded; 422 for invalid payloads or input the model
 generated) and `X-Process-Time-Ms`. Each prediction is logged as one JSON line on the
 `fraud_detection.api.predictions` logger, for drift monitoring and joining fraud labels later.
 
+### Life of a request
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant MW as Middleware
+    participant EP as /predict
+    participant MB as MicroBatcher<br/>(if MICROBATCH_WAIT_MS > 0)
+    participant PF as FraudPyfunc
+    participant RS as RecordScorer<br/>(NumPy fast path)
+    C->>MW: POST /predict {TransactionID, features}
+    MW->>EP: request_id (X-Request-ID or new)
+    Note over EP: pydantic validates Transaction<br/>(422 on bad payload)
+    alt micro-batching off (default)
+        EP->>PF: predict([record]) in a worker thread
+    else micro-batching on
+        EP->>MB: submit(tx)
+        MB->>PF: predict(records of all waiting requests)
+    end
+    PF->>RS: predict_records
+    RS-->>PF: probabilities (ValueError → 422)
+    PF-->>EP: probability
+    Note over EP: is_fraud = p ≥ threshold<br/>Prometheus counters, JSON prediction log
+    EP-->>MW: Prediction
+    MW-->>C: 200 + X-Request-ID, X-Process-Time-Ms
+```
+
+At startup the lifespan handler resolves `MODEL_URI` (e.g. `@champion`) to a fixed version, reads
+the threshold from the model metadata (unless `FRAUD_THRESHOLD` is set) and scores one dummy row,
+so the first real request does not pay for building the fast path. The model is never reloaded
+while the process runs: after `@champion` moves, restart the API (or roll the containers).
+
 ### Request: `Transaction`
 
 ```json
@@ -118,7 +150,7 @@ any identity column is set) unless sent.
 | Env variable | Default | Meaning |
 |---|---|---|
 | `MODEL_URI` | `models:/fraud-detection@champion` | Alias, version (`models:/fraud-detection/3`) or `runs:/<id>/...`; an alias is resolved to a version at startup |
-| `FRAUD_THRESHOLD` | unset | Overrides the threshold stored with the model |
+| `FRAUD_THRESHOLD` | unset | Overrides the threshold stored with the model. Keep it unset (`.env.example` leaves it commented out) unless you mean to bypass the cost-optimal threshold |
 | `MLFLOW_TRACKING_URI` | — (compose: `http://mlflow:5000`, local: `sqlite:///mlflow.db`) | Where the registry lives |
 | `WEB_CONCURRENCY` | `4` (Docker) | uvicorn worker processes; about one per core given to the container. `make api-prod WORKERS=n` locally |
 | `OMP_NUM_THREADS` | `1` (Docker, `api-prod`) | One thread per worker; scale with workers |
@@ -199,6 +231,39 @@ Reading it:
   `localhost` tried IPv6 first and cost ~2 s here, which made the first run of the 10 per minute
   scenarios look like 266 ms.
 
+### Latency per model type
+
+The numbers above are for the LightGBM champion. `scripts/serving_latency.py`
+(`make serving-latency`) times every saved model (`data/06_models/{model}.pkl`, all 395
+features) one row at a time, in-process. Its output is `data/08_reporting/serving_latency.csv`.
+p50 in ms:
+
+| Model | Pandas path | NumPy fast path | Fast path, 1 thread | Model only, 1 thread |
+|---|---|---|---|---|
+| **LightGBM** | 170 | 1.9 | **0.8** | 7.5 |
+| CatBoost | 123 | 28 | 21 | 20 |
+| XGBoost | 174 | 50 | 21 | 13 |
+| HistGB | 210 | 73 | 32 | 17 |
+| Random forest | 191 | 65 | 41 | 23 |
+| Logistic regression | 377 | 131 | 42 | 37 |
+
+- **LightGBM is the only model that stays NumPy end to end.** `RecordScorer` passes it the float
+  matrix directly. Every other model type gets a pandas DataFrame with category dtypes rebuilt
+  from that matrix, and the rebuild plus the library's own DataFrame handling costs 10–40 ms.
+  That is also why LightGBM's "model only" time on a DataFrame (7.5 ms) is higher than its whole
+  fast path.
+- **Threads slow down single rows.** With the default thread settings (`n_jobs=-1`, OpenMP), each
+  call starts a thread pool for one row. One thread is 2–3× faster for XGBoost, HistGB and random
+  forest. CatBoost is the exception. The API does not set this yet: a single-row service should
+  score with one thread, and batch scoring can keep all cores.
+- **The number of features matters less than either.** On the
+  [feature-count study](06_modeling_approach.md#how-many-features-are-needed), going from 395 to
+  100 features roughly halves the DataFrame-path model time, but it does not touch the
+  pandas-vs-NumPy gap.
+
+Measured on the same Windows laptop as the load test (32 threads). One-off runs vary by ±30%, so
+compare models within one run.
+
 ## Scaling
 
 Scoring is CPU work, and Python runs CPU work in one thread at a time per process, so **async or
@@ -243,6 +308,17 @@ What this says, and what it does not:
   logging, which batching the model call does not reduce, and the wait adds latency. It is kept
   as an option for setups where the model call dominates (bigger models, more features, or
   slower hardware); turn it on only if a load test shows a gain.
+
+## Before real production traffic
+
+Deliberately out of scope for this project, and what a production deployment would add:
+
+| Gap | Today | Typical fix |
+|---|---|---|
+| Authentication, rate limiting | none | API gateway or reverse proxy in front (API keys / mTLS, per-client limits) |
+| Picking up a new champion | restart | rolling restart triggered by the registry change, or a periodic alias check |
+| Drift monitoring | prediction log + score histogram | ship the JSON log to a store, compare feature and score distributions (PSI) against the training data |
+| Capacity numbers | measured on one Windows laptop | load test on the deployment platform, client on another machine |
 
 ---
 [← 6. Modeling approach](06_modeling_approach.md) · [Next: 8. Model card →](08_model_card.md)

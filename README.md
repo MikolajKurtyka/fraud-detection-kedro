@@ -24,14 +24,15 @@ and a containerised FastAPI scoring service.
 | CI (lint, tests, Kedro load check, Docker build) | Done |
 | `data_cleaning` (time split, column filter fitted on train) | Done |
 | `feature_engineering` (time features, client UID, aggregations, encodings) | Done |
-| `training` (LightGBM / XGBoost / CatBoost + Optuna, MLflow child runs) | Code done. Baseline trained; **Optuna tuning not run yet** |
-| `evaluation`: precision / recall / F1 at 3 thresholds, PR + ROC curves, logged into MLflow | Done |
+| `training` (LightGBM / XGBoost / CatBoost + Optuna, 3 scikit-learn baselines, optional time-series CV, refit on train + valid, MLflow child runs) | Code done. Baseline trained; **Optuna tuning not run yet** |
+| `evaluation`: precision / recall / F1 at 4 thresholds, PR + ROC + cost curves, logged into MLflow | Done |
 | `evaluation`: Kaggle submissions per model + rank-average blend | Done (files written, not uploaded yet) |
 | Run history table from MLflow (`scripts/compare_runs.py`) | Done |
 | `evaluation`: cost-based threshold (used by the API), global SHAP importance | Done |
 | Inference wrapper for the API (`InferenceBundle` + `FraudPyfunc` in `src/fraud_detection/inference.py`) | Done |
 | NumPy fast path for serving (`fast_inference.py`, ~2 ms per row, bit-identical to the pandas path) | Done |
 | Open-loop async load test, 1–10000 requests/min × 1–1000 rows (`make loadtest`) | Done |
+| Feature-count study (accuracy / size / latency vs top-N features, all 6 models) and per-model serving latency (`make feature-study`, `make serving-latency`) | Done |
 | `serving`: register the bundle in the MLflow registry, move `@champion` only if PR-AUC improves (`make register`) | Done |
 | `data_validation` (pandera schemas, train/test parity) | Done |
 | Per-prediction SHAP explanations (`POST /explain`) | Done |
@@ -51,40 +52,38 @@ This project builds the full path:
 
 ## Architecture
 
-```
-┌──────────────────────────── Kedro project ─────────────────────────────┐
-│                                                                        │
-│  01_raw          02_intermediate     04_feature        06_models       │
-│ ┌──────────┐    ┌──────────────┐   ┌─────────────┐   ┌─────────────┐   │
-│ │ Kaggle   │    │ train / test │   │ engineered  │   │ LightGBM +  │   │
-│ │ CSVs     │───►│ joined,      │──►│ features    │──►│ Optuna      │   │
-│ │ (+ hash  │    │ typed,       │   │ (time, UID, │   │ (time-based │   │
-│ │ manifest)│    │ parquet      │   │ aggregates) │   │ CV, PR-AUC) │   │
-│ └──────────┘    └──────┬───────┘   └─────────────┘   └──────┬──────┘   │
-│  data_ingestion        │ data_validation                    │          │
-│                        ▼ (pandera)                          ▼          │
-│                 ┌──────────────┐                     ┌─────────────┐   │
-│                 │ validation   │      08_reporting   │ evaluation  │   │
-│                 │ report       │    ◄────────────────│ cost-based  │   │
-│                 └──────────────┘                     │ threshold,  │   │
-│                                                      │ SHAP        │   │
-└──────────────────────────────────────────────────────┴──────┬──────┴───┘
-                                                              │ kedro-mlflow:
-                                                              │ inference pipeline
-                                                              ▼ = one MLflow model
-┌───────────────── docker compose ─────────────────────────────────────────┐
-│                                                                          │
-│  ┌────────────┐      ┌───────────────────────┐      ┌─────────────────┐  │
-│  │ Postgres   │◄─────│ MLflow server         │◄─────│ FastAPI         │  │
-│  │ (metadata) │      │ tracking + registry   │ load │ /predict        │  │
-│  └────────────┘      │ alias: @champion      │      │ /health         │  │
-│                      └───────────────────────┘      └────────┬────────┘  │
-└──────────────────────────────────────────────────────────────┼───────────┘
-                                                               │
-                                     client ── POST /predict ──┘ → fraud probability + decision
+```mermaid
+flowchart LR
+    subgraph kedro["Kedro project (kedro run)"]
+        direction LR
+        RAW[("01_raw<br/>Kaggle CSVs<br/>+ SHA256 manifest")]
+        ING["data_ingestion<br/>type + join"]
+        VAL["data_validation<br/>pandera checks"]
+        CLN["data_cleaning<br/>time split +<br/>column filter"]
+        FE["feature_engineering<br/>D-norm, UID,<br/>aggregates, encodings"]
+        TR["training<br/>3 boosting + 3 baselines<br/>Optuna, refit"]
+        EV["evaluation<br/>4 thresholds incl. min cost,<br/>curves, SHAP, submissions"]
+        SV["serving<br/>InferenceBundle →<br/>MLflow pyfunc"]
+        RAW --> ING --> VAL
+        ING --> CLN --> FE --> TR --> EV --> SV
+    end
 
-GitHub Actions: lint → tests → Kedro load check → Docker image build
+    subgraph compose["docker compose"]
+        PG[(Postgres<br/>metadata)]
+        MF["MLflow server<br/>tracking + registry<br/>alias @champion"]
+        API["FastAPI<br/>/predict · /predict/batch<br/>/explain · /health/* · /metrics"]
+        MF --> PG
+        API -->|"load pinned version<br/>at startup"| MF
+    end
+
+    TR & EV -.->|"runs, metrics,<br/>artifacts"| MF
+    SV -->|"register; move @champion<br/>only if PR-AUC improves"| MF
+    Client([Client]) -->|"POST /predict"| API
+    API -->|"probability + decision<br/>(cost-optimal threshold)"| Client
 ```
+
+GitHub Actions: `ci.yml` runs lint → tests → Kedro load check → Docker image build on every push and
+PR; `retrain.yml` retrains, evaluates and registers LightGBM every Monday.
 
 ## Key Components
 
@@ -96,16 +95,29 @@ GitHub Actions: lint → tests → Kedro load check → Docker image build
 | `data_validation` | `02_intermediate` → `08_reporting` | pandera checks: dtypes, unique IDs, value ranges, required columns, time order, fraud rate; train/test parity (columns, dtypes, test after train, null rates). Stops the run if a check fails |
 | `data_cleaning` | `02` → `03_primary` | Time split (earlier 80% of days = train, rest = valid); drops near-empty, near-constant and correlated V columns with a filter fitted on train |
 | `feature_engineering` | `03` → `04_feature` → `05_model_input` | Time features, normalized D columns, email parts, client UID proxy, group-ratio / frequency / UID aggregates and category encodings fitted on train |
-| `training` | `05` → `06_models` | LightGBM, XGBoost (GPU), CatBoost (GPU), each with Optuna tuning, early stopping on valid, one nested MLflow run per model |
+| `training` | `05` → `06_models` | LightGBM, XGBoost (GPU), CatBoost (GPU) with Optuna tuning, plus logistic regression, random forest and HistGradientBoosting baselines; early stopping on valid, optional time-series CV, refit on train + valid for the submission; one nested MLflow run per model |
 | `evaluation` | `06` → `08_reporting` | Precision / recall / F1 at 4 thresholds incl. the cost-optimal one, PR + ROC + cost curves, global SHAP importance (boosting models), Kaggle submissions per model + blend |
 | `serving` | `06` + fitted artifacts → MLflow registry | Wraps one model (LightGBM by default) with its column filter and encoders as an MLflow pyfunc, registers it as `fraud-detection`, moves `@champion` only if valid PR-AUC improves |
 
 **MLflow** (through `kedro-mlflow`) records parameters, metrics and artifacts for every `kedro run`
 and keeps models in the registry. The model that serves traffic carries the `champion` alias.
 
-**Scoring API** (`src/fraud_detection/api/`) is a FastAPI app that loads `models:/fraud-detection@champion`
-at startup and exposes `/predict` and `/health`. It still starts without a model and `/health` reports that,
-so a deployment never fails silently.
+**Scoring API** (`src/fraud_detection/api/`) is a FastAPI app that resolves `models:/fraud-detection@champion`
+to a concrete version at startup and exposes `/predict`, `/predict/batch`, `/explain`, `/health/live`,
+`/health/ready` and Prometheus `/metrics`. It still starts without a model; `/health/ready` then returns
+503 with the reason, so a deployment never fails silently. A new champion is picked up on restart.
+
+> **Not production-ready yet.** These gaps are deliberately out of scope here and must be handled
+> before the API takes real traffic:
+>
+> - **No authentication or rate limiting.** Anyone who can reach the port can score and call
+>   `/explain`. Put an API gateway or reverse proxy in front (API keys or mTLS, per-client limits).
+> - **No hot reload of the model.** A new `@champion` is only served after the API restarts. Trigger
+>   a rolling restart on registry changes, or check the alias periodically.
+> - **No drift monitoring.** Predictions are logged and the score histogram is on `/metrics`, but
+>   nothing compares live feature or score distributions against the training data.
+>
+> Details and typical fixes: [docs/07_serving_api.md](docs/07_serving_api.md#before-real-production-traffic).
 
 ## Project Structure
 
@@ -127,11 +139,18 @@ fraud-detection-kedro/
 ├── notebooks/                     # exploration only, no pipeline logic
 ├── scripts/
 │   ├── download_data.py           # Kaggle download, idempotent, writes manifest
+│   ├── compare_runs.py            # history of trained models from MLflow (make compare)
+│   ├── feature_size_study.py      # accuracy / size / latency vs number of features (make feature-study)
+│   ├── serving_latency.py         # single-row latency per model: pandas vs NumPy, threads (make serving-latency)
+│   ├── loadtest.py                # open-loop load test of a running API (make loadtest)
 │   ├── setup.ps1                  # one-command setup (Windows)
 │   └── setup.sh                   # one-command setup (Linux/macOS)
 ├── src/fraud_detection/
 │   ├── pipelines/                 # one folder per Kedro pipeline
-│   ├── api/                       # FastAPI scoring service
+│   ├── api/                       # FastAPI scoring service (+ optional micro-batching)
+│   ├── inference.py               # InferenceBundle (raw rows → probability) + MLflow pyfunc
+│   ├── fast_inference.py          # NumPy fast path the API uses (same scores)
+│   ├── keys.py                    # stable string keys for categories
 │   ├── pipeline_registry.py
 │   └── settings.py
 ├── tests/
@@ -249,14 +268,16 @@ Step 4 without tuning (~8 min): add
 
 ### Training
 
-`training` runs LightGBM (CPU), XGBoost (GPU) and CatBoost (GPU) one after another. Each model is
-tuned with Optuna (`n_trials`, `timeout_minutes`) and then fitted once more with the best parameters,
-with early stopping on the valid split. All settings are in `conf/base/parameters_training.yml`.
-Parameter optimisation only happens when `n_trials > 0` (default 25 per model).
+`training` runs LightGBM (CPU), XGBoost (GPU) and CatBoost (GPU), then the three baselines
+(logistic regression, random forest, HistGradientBoosting), one after another. Each model is tuned
+with Optuna (`n_trials`, `timeout_minutes`) and then fitted once more with the best parameters,
+with early stopping on the valid split, and finally refitted on train + valid for the Kaggle
+submission. All settings are in `conf/base/parameters_training.yml`. Parameter optimisation only
+happens when `n_trials > 0` (default 25 per boosting model, 0 for the baselines).
 
 ```bash
 # One model only
-uv run kedro run --pipelines training_lightgbm      # or training_xgboost / training_catboost
+uv run kedro run --pipelines training_lightgbm      # or training_xgboost / _catboost / _logreg / _random_forest / _hist_gb
 
 # Quick baseline: skip tuning, train once with the base params (~8 min for all three)
 uv run kedro run --pipelines training --params "lightgbm.model_options.n_trials=0,xgboost.model_options.n_trials=0,catboost.model_options.n_trials=0"   # make train-fast
@@ -267,8 +288,9 @@ uv run kedro run --pipelines training_xgboost --params "xgboost.model_options.n_
 
 No NVIDIA GPU? Set `device: cpu` for XGBoost and `device: CPU` for CatBoost in `parameters_training.yml`.
 
-Outputs: `data/06_models/<model>.pkl`, `data/06_models/<model>_best_params.json`,
-`data/08_reporting/<model>_metrics.json` and `data/08_reporting/<model>_feature_importance.csv`.
+Outputs: `data/06_models/<model>.pkl` (train only, the validated one),
+`data/06_models/<model>_final.pkl` (refitted on train + valid), `data/06_models/<model>_best_params.json`,
+`data/08_reporting/<model>_metrics.json`, `<model>_cv_metrics.json` and `<model>_feature_importance.csv`.
 
 ### Evaluation: precision, recall, curves
 
@@ -321,8 +343,9 @@ uv run kaggle competitions submissions -c ieee-fraud-detection   # see the score
 
 Or upload the CSV on the competition page → **Submit Prediction**.
 
-The models are trained on the first 80% of days only. Retraining on all labelled data before
-submitting would likely score a bit higher; that is not implemented yet.
+Submissions come from `<model>_final.pkl`: the model refitted on all labelled data (train + valid,
+`refit: true`) with `best_iteration × 1.2` trees, because the valid days are the closest to test.
+All valid metrics still come from the train-only `<model>.pkl`.
 
 ### Watching a run
 
@@ -354,7 +377,7 @@ Direct links (open them while the UI is running):
 
 | View | Link |
 |---|---|
-| The model runs only (lightgbm / xgboost / catboost), best PR-AUC first | http://localhost:5000/#/experiments/1/runs?searchFilter=tags.stage%20%3D%20%27final%27&orderByKey=metrics.%60valid_pr_auc%60&orderByAsc=false |
+| The model runs only (one per model type), best PR-AUC first | http://localhost:5000/#/experiments/1/runs?searchFilter=tags.stage%20%3D%20%27final%27&orderByKey=metrics.%60valid_pr_auc%60&orderByAsc=false |
 | Same runs as bar charts, one chart per metric | http://localhost:5000/#/experiments/1/runs?searchFilter=tags.stage%20%3D%20%27final%27&orderByKey=metrics.%60valid_pr_auc%60&orderByAsc=false&compareRunsMode=CHART |
 | All runs (pipelines, tuning, models) | http://localhost:5000/#/experiments/1/runs |
 
@@ -383,7 +406,8 @@ What every hyperparameter means, with base values and Optuna ranges:
 How runs are organised:
 
 - Experiment **fraud-detection** holds one parent run per `kedro run`.
-- Expand a parent run (**+**) to see one child run per model: **lightgbm**, **xgboost**, **catboost**.
+- Expand a parent run (**+**) to see one child run per model: **lightgbm**, **xgboost**, **catboost**,
+  **logreg**, **random_forest**, **hist_gb**.
   They log the same metric names (`valid_roc_auc`, `valid_pr_auc`, `train_roc_auc`, `roc_auc_gap`,
   `best_iteration`, `fit_seconds`), so add those columns and sort to compare models.
 - Each model child run stores `feature_importance.csv` under **Artifacts**.
@@ -401,7 +425,11 @@ docker compose up -d --build    # make docker-up
 | Service | URL | Purpose |
 |---|---|---|
 | MLflow | http://localhost:5000 | Tracking UI and model registry (Postgres backend) |
-| API | http://localhost:8000/docs | Swagger UI for `/predict` and `/health` |
+| API | http://localhost:8000/docs | Swagger UI for `/predict`, `/predict/batch`, `/explain` and `/health/*` |
+
+The API container waits until the MLflow server answers its healthcheck, because it loads the
+`@champion` model once at startup. Register a model first (`make train` or `make register` with
+`MLFLOW_TRACKING_URI=http://localhost:5000`), then restart the API (`docker compose restart api`).
 
 Example request:
 
@@ -412,8 +440,12 @@ curl -X POST http://localhost:8000/predict \
 ```
 
 ```json
-{"TransactionID": 3663549, "fraud_probability": 0.031, "is_fraud": false, "threshold": 0.42, "model_uri": "models:/fraud-detection@champion"}
+{"TransactionID": 3663549, "fraud_probability": 0.031, "is_fraud": false, "threshold": 0.077,
+ "model_version": "2", "model_uri": "models:/fraud-detection/2"}
 ```
+
+`model_uri` is the pinned version the alias pointed to at startup, so every response says exactly
+which model scored it.
 
 `POST /explain?top_k=5` takes the same body and adds the features that pushed this score up or
 down most (SHAP values in log-odds, ~110 ms per row, so it is kept off `/predict`):
@@ -425,7 +457,8 @@ down most (SHAP values in log-odds, ~110 ms per row, so it is kept off `/predict
                    {"feature": "card5", "value": "166", "shap": -0.218}, ...]}
 ```
 
-Until a model is registered and given the `champion` alias, `/health` returns `"model_loaded": false` and `/predict` returns `503`.
+Until a model is registered and given the `champion` alias, `/health/ready` returns `503` with
+`"model_loaded": false` and the load error, and `/predict` returns `503`.
 
 ### Tests and code quality
 
@@ -480,6 +513,28 @@ Summary for LightGBM (baseline):
 | ROC-AUC | 0.931 | the Kaggle leaderboard metric |
 | Recall @ 1% FPR | 0.537 | fraud caught when 1 in 100 good transactions is flagged |
 | Expected cost / 10k transactions | $27.8k (vs $51.6k with no model) | at the cost-optimal threshold, assumptions in the next section |
+
+### Fewer features, smaller models, faster serving
+
+`make feature-study` retrains each model on its top-N features, with the tuned params and with
+small "compact" trees. Valid PR-AUC, tuned params:
+
+| Model | 395 features | 200 | 100 | 50 | 25 |
+|---|---|---|---|---|---|
+| XGBoost | 0.616 | **0.623** | 0.614 | 0.601 | 0.561 |
+| LightGBM | 0.613 | 0.616 | 0.611 | 0.601 | 0.559 |
+| HistGB | 0.591 | 0.613 | 0.597 | 0.593 | 0.549 |
+| CatBoost | 0.567 | 0.573 | 0.551 | 0.554 | 0.532 |
+
+- The top 100–150 features keep the full model's accuracy, and ~50 lose only ~0.01.
+- Model size comes from the tree settings, not the feature count. Compact trees are 3–10× smaller
+  (1.5–5 MB) for 0.01–0.04 less PR-AUC.
+- Serving speed is decided by the code path, not the feature count. On the API's NumPy fast path,
+  LightGBM scores a raw row in **~2 ms (0.8 ms single-threaded)**. The other model types need a
+  pandas DataFrame and take 20–70 ms (`make serving-latency`).
+
+Details: [Modeling approach](docs/06_modeling_approach.md#how-many-features-are-needed) and
+[Serving API](docs/07_serving_api.md#latency-per-model-type).
 
 ## Metrics Explained: What They Mean for the Business
 

@@ -14,9 +14,9 @@ configuration, experiment tracking, containers and CI.
 | Pipeline graph | `kedro-viz` (dev) | Interactive lineage graph (`make viz`) |
 | Data | pandas, pyarrow (parquet) | In-memory tables, columnar storage between layers |
 | Models | LightGBM, XGBoost, CatBoost; scikit-learn (logistic regression, random forest, HistGradientBoosting, metrics) | Gradient-boosted trees, baselines, ROC-AUC / PR-AUC |
-| Reporting | matplotlib | PR and ROC curves per model (`{model}_curves.png`) |
+| Reporting | matplotlib | PR, ROC and cost curves per model (`{model}_curves.png`), SHAP bar chart (`{model}_shap.png`) |
 | Tuning | Optuna (TPE sampler) | Hyperparameter search on the time-based validation split |
-| Tracking | MLflow ≥ 2.17 via `kedro-mlflow` | Parameters, metrics, artifacts, model registry |
+| Tracking | MLflow 3 (≥ 3.5) via `kedro-mlflow` | Parameters, metrics, artifacts, model registry |
 | Validation | pandera | Schema, value-range and train/test parity checks (`data_validation`) |
 | Explainability | TreeSHAP (built into LightGBM / XGBoost / CatBoost) | Global importance per model, per-prediction explanations on `/explain` |
 | Serving | FastAPI, uvicorn, pydantic | REST scoring service |
@@ -48,8 +48,14 @@ flowchart TB
         API["FastAPI :8000<br/>/predict /predict/batch /explain<br/>/health/* /metrics"]
         MF --> PG
         MF --> ART
-        API -->|"load models:/fraud-detection@champion"| MF
+        API -->|"load models:/fraud-detection@champion<br/>(starts once MLflow is healthy)"| MF
     end
+
+    subgraph gha["GitHub Actions"]
+        CI["ci.yml<br/>lint · tests · docker build"]
+        RT["retrain.yml (weekly)<br/>train · evaluate · register"]
+    end
+    RT -.->|"MLFLOW_TRACKING_URI<br/>(hosted server)"| MF
 
     K -.->|"MLFLOW_TRACKING_URI=<br/>http://localhost:5000"| MF
     Client([Client]) -->|POST /predict| API
@@ -68,10 +74,12 @@ fraud-detection-kedro/
 │   │   ├── catalog.yml                # every dataset, mostly dataset factories
 │   │   ├── parameters.yml             # shared: random_state, target
 │   │   ├── parameters_data_ingestion.yml
+│   │   ├── parameters_data_validation.yml  # required columns, value ranges, fraud rate, null drift
 │   │   ├── parameters_data_cleaning.yml
 │   │   ├── parameters_feature_engineering.yml
 │   │   ├── parameters_training.yml    # one block per model
-│   │   ├── parameters_evaluation.yml  # fixed threshold, target FPR
+│   │   ├── parameters_evaluation.yml  # fixed threshold, target FPR, cost matrix, SHAP sample
+│   │   ├── parameters_serving.yml     # registered model name, alias, threshold + promotion metric
 │   │   └── mlflow.yml                 # kedro-mlflow config
 │   ├── local/                         # machine overrides + secrets (git-ignored)
 │   └── logging.yml                    # console (rich) + logs/info.log, logs/errors.log
@@ -83,8 +91,9 @@ fraud-detection-kedro/
 │   ├── download_data.py               # Kaggle download, idempotent, SHA256 manifest
 │   ├── compare_runs.py                # history of final model runs from MLflow (make compare)
 │   ├── feature_size_study.py          # accuracy / size / latency vs top-N features (make feature-study)
+│   ├── serving_latency.py             # single-row latency per model: pandas vs NumPy path, threads (make serving-latency)
 │   ├── loadtest.py                    # open-loop async load test of a running API (make loadtest)
-│   ├── setup.ps1 / setup.sh           # one-command setup
+│   └── setup.ps1 / setup.sh           # one-command setup
 ├── src/fraud_detection/
 │   ├── pipelines/
 │   │   ├── data_ingestion/            # nodes.py + pipeline.py per pipeline
@@ -100,8 +109,8 @@ fraud-detection-kedro/
 │   ├── keys.py                        # to_key(): stable string keys for categories
 │   ├── pipeline_registry.py           # which pipelines exist
 │   └── settings.py                    # OmegaConfigLoader + oc.env resolver
-├── tests/                             # mirrors src/: api/, pipelines/
-├── .github/workflows/          # ci.yml (every push / PR), retrain.yml (weekly)
+├── tests/                             # mirrors src/: api/, pipelines/, test_inference.py
+├── .github/workflows/                 # ci.yml (every push / PR), retrain.yml (weekly)
 ├── Dockerfile                         # API image (multi-stage, uv)
 ├── docker-compose.yml                 # Postgres + MLflow + API
 ├── Makefile
@@ -120,7 +129,8 @@ Kedro loads configuration with `OmegaConfigLoader` (`src/fraud_detection/setting
 | Custom resolver | `${oc.env:VAR,default}`, used in `mlflow.yml` so Docker or CI can redirect tracking |
 
 **Parameters** are split per pipeline. Each `parameters_<pipeline>.yml` holds one top-level key
-(`data_ingestion`, `data_cleaning`, `feature_engineering`) and each node receives the whole block
+(`data_ingestion`, `data_validation`, `data_cleaning`, `feature_engineering`, `evaluation`,
+`serving`) and each node receives the whole block
 (`params:data_cleaning`). Training has one block per model (`lightgbm`, `xgboost`, `catboost`,
 `logreg`, `random_forest`, `hist_gb`), and each block is that model's `model_options` inside its namespaced pipeline. Shared values
 (`target: isFraud`, `random_state: 42`) live in `parameters.yml`.
@@ -149,8 +159,9 @@ exported):
 |---|---|---|
 | `MLFLOW_TRACKING_URI` | `sqlite:///mlflow.db` (in `mlflow.yml`) | `kedro-mlflow`, API |
 | `MODEL_URI` | `models:/fraud-detection@champion` | API |
-| `FRAUD_THRESHOLD` | empty → the `threshold` stored in the model metadata → `0.5` | API, decision cut-off |
-| `WEB_CONCURRENCY` | `2` | API container: number of uvicorn worker processes |
+| `FRAUD_THRESHOLD` | unset → the `threshold` stored in the model metadata (cost-optimal) → `0.5` | API, decision cut-off. Leave unset unless you mean to override the model's threshold |
+| `WEB_CONCURRENCY` | `4` | API container: number of uvicorn worker processes |
+| `MICROBATCH_WAIT_MS` / `MICROBATCH_MAX_SIZE` | `0` (off) / `64` | API: optional micro-batching of `/predict` |
 | `LOG_LEVEL` | `INFO` | API logging (request lines + one JSON line per prediction) |
 | `OMP_NUM_THREADS` | `1` (set in the image) | One OpenMP thread per worker, so workers don't oversubscribe the CPUs |
 | `PROMETHEUS_MULTIPROC_DIR` | `/tmp/prometheus` (set in the image) | Lets `/metrics` aggregate across workers |
@@ -185,7 +196,8 @@ The **final** run is the model's single row in MLflow. Later nodes write into it
 | `train_model` | `train_*`, `valid_*`, `roc_auc_gap`, `best_iteration`, `n_features`, `fit_seconds`; params incl. `device`, `imbalance` |
 | `cross_validate` (if `cv_folds > 0`) | `cv_roc_auc_mean/std`, `cv_pr_auc_mean/std` |
 | `refit_model` (if `refit: true`) | `refit_rows`, `refit_iterations`, `refit_seconds` |
-| `evaluate_model` | `eval_*` (precision / recall / F1 / FPR / confusion counts at three thresholds) + the `evaluation_curves.png` figure |
+| `evaluate_model` | `eval_*` (precision / recall / F1 / FPR / confusion counts and cost per 1k at four thresholds: fixed, best F1, 1% FPR, min cost) + the `evaluation_curves.png` figure |
+| `explain_model` (boosting models) | `shap_importance.png` and `shap_importance.csv` artifacts |
 
 Every model logs the same metric names, so you can compare them side by side in the MLflow UI.
 Tags `model_type` and `stage` (`tuning` / `trial` / `final`) make filtering easy.
@@ -234,7 +246,7 @@ columns cover training, CV, refit and `eval_*` metrics; any column a run didn't 
 
 | Image | File | Contents |
 |---|---|---|
-| API | `Dockerfile` | Multi-stage. The **builder** stage runs `uv sync --frozen --no-dev` (dependencies are cached in their own layer before the source is copied). The **runtime** stage is `python:3.12-slim` + `libgomp1` (needed by LightGBM) + the virtualenv. It runs as the non-root `app` user, and its `HEALTHCHECK` hits `/health/live` (liveness only: the container counts as healthy even without a model). It starts `uvicorn` on port 8000 with `WEB_CONCURRENCY` workers (default 2) and `--no-access-log` (the app's middleware logs requests). It also sets `OMP_NUM_THREADS=1` and resets `PROMETHEUS_MULTIPROC_DIR` at start |
+| API | `Dockerfile` | Multi-stage. The **builder** stage runs `uv sync --frozen --no-dev` (dependencies are cached in their own layer before the source is copied). The **runtime** stage is `python:3.12-slim` + `libgomp1` (needed by LightGBM) + the virtualenv. It runs as the non-root `app` user, and its `HEALTHCHECK` hits `/health/live` (liveness only: the container counts as healthy even without a model). It starts `uvicorn` on port 8000 with `WEB_CONCURRENCY` workers (default 4) and `--no-access-log` (the app's middleware logs requests). It also sets `OMP_NUM_THREADS=1` and resets `PROMETHEUS_MULTIPROC_DIR` at start |
 | MLflow | `docker/mlflow.Dockerfile` | `python:3.12-slim` + `mlflow>=3.5,<4` + `psycopg2-binary` |
 
 ### docker compose services
@@ -242,8 +254,11 @@ columns cover training, CV, refit and `eval_*` metrics; any column a run didn't 
 | Service | Image | Port | Storage | Depends on |
 |---|---|---|---|---|
 | `postgres` | `postgres:16-alpine` | internal | volume `postgres-data` | — (healthcheck `pg_isready`) |
-| `mlflow` | `docker/mlflow.Dockerfile` | 5000 | volume `mlflow-artifacts` (`/mlartifacts`) | `postgres` healthy |
-| `api` | `Dockerfile` | 8000 | — | `mlflow` |
+| `mlflow` | `docker/mlflow.Dockerfile` | 5000 | volume `mlflow-artifacts` (`/mlartifacts`) | `postgres` healthy (own healthcheck: `GET /health`) |
+| `api` | `Dockerfile` | 8000 | — | `mlflow` healthy |
+
+The API loads its model once, at startup, so it waits for a healthy MLflow server. Without that, a
+cold `docker compose up` could start the API first and leave it running with no model.
 
 The MLflow server stores run metadata in Postgres and serves artifacts itself
 (`--artifacts-destination`), so clients don't need direct access to the storage.
@@ -269,7 +284,8 @@ flowchart LR
 ```
 
 Locally, pre-commit runs the same ruff checks plus trailing-whitespace, end-of-file, YAML and
-large-file (>1 MB) checks on every commit.
+large-file (>1 MB) checks on every commit. Keep the hook's ruff `rev` equal to the ruff version in
+`uv.lock`, otherwise the hook and CI format code differently.
 
 ### Scheduled retraining
 
@@ -283,6 +299,7 @@ flowchart LR
     C --> D["evaluation<br/>(lightgbm namespace)"]
     D --> E["serving: register on<br/>MLFLOW_TRACKING_URI"]
     E -->|"PR-AUC beats champion"| F["@champion moves"]
+    E -->|"otherwise"| G["new version registered,<br/>@champion kept"]
 ```
 
 | Secret | Required | Use |
@@ -306,12 +323,13 @@ The API picks up a new champion on its next restart.
 | `make validate` | `kedro run --pipelines data_validation` | pandera checks on 02 → `08_reporting/data_validation.json` |
 | `make features` | `… data_cleaning,feature_engineering` | 02 → 05 |
 | `make train` | `… training,evaluation,serving` | Tune and train all models, evaluate, write submissions, register LightGBM |
-| `make train-fast` | `… training,evaluation --params "*.n_trials=0"` | Same, once with the base params, no tuning |
+| `make train-fast` | `… training,evaluation --params "*.n_trials=0"` | Train and evaluate once with the base params, no tuning (does not register) |
 | `make baselines` | `… --namespaces logreg,random_forest,hist_gb` | Train and evaluate only the three baselines |
 | `make evaluate` | `kedro run --pipelines evaluation` | Metrics, cost threshold, curves, SHAP and submissions for the saved models |
 | `make register` | `kedro run --pipelines serving` | Register the saved LightGBM in MLflow; `@champion` moves if it beats the current one |
 | `make compare` | `scripts/compare_runs.py` | Run history table from MLflow |
 | `make feature-study` | `scripts/feature_size_study.py` | Accuracy, model size and latency vs number of features |
+| `make serving-latency` | `scripts/serving_latency.py` | Single-row latency of every saved model: pandas vs NumPy path, default threads vs one thread |
 | `make run` | `kedro run` | All pipelines (`__default__`) |
 | `make viz` | `kedro viz run` | Pipeline graph in the browser |
 | `make mlflow` | `mlflow ui …` | Local MLflow UI on :5000 |

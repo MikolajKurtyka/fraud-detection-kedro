@@ -99,16 +99,13 @@ the schema in `conf/base/parameters_data_ingestion.yml`, and turns `315.0` into 
 
 | Challenge | Evidence | How the project handles it |
 |---|---|---|
-| Class imbalance | `isFraud` mean 0.035 (train split 0.0351, valid split 0.0344) | Ranking metrics (PR-AUC, ROC-AUC), no resampling, cost-based threshold |
+| Class imbalance | `isFraud` mean 0.035 (train split 0.0351, valid split 0.0344) | Ranking metrics (PR-AUC, ROC-AUC), no resampling by default (class weights / undersampling are a switch), cost-based threshold |
 | Drift over time | `TransactionDT` covers ~182 days; test follows train. `D1`–`D15` grow with time | Time-based split; drop `TransactionDT`; `D_n_norm = day − D_n` |
 | Many nulls | 214 of 435 columns are more than half null; identity columns ≥76% null; `V` columns up to 86% null | NaN kept as is (trees route it), `has_identity` flag, drop only columns >99% null |
 | Redundant columns | The 339 `V` columns fall into 15 blocks with identical null shares, often highly correlated within a block | Per-block correlation filter (\|r\| > 0.95) → 56 `V` columns dropped |
 | High-cardinality codes | `card1` 13,553 values, `DeviceInfo` 1,786 | Frequency encoding, integer codes (>100 categories), group statistics |
 
 Details: [6. Modeling approach](06_modeling_approach.md).
-
----
-[← 2. Infrastructure](02_infrastructure.md) · [Next: 4. Data layers and catalog →](04_data_layers.md)
 
 ## Types in `02_intermediate`
 
@@ -129,3 +126,9 @@ A column in the file that is missing from the schema, or vice versa, fails the r
 
 The stats tables above were computed before this typing, so `card1` and `addr1` show numeric
 examples; in `02_intermediate` they are categorical strings.
+
+The `data_validation` pipeline then checks these tables (dtypes, unique IDs, value ranges, time
+order, fraud rate, train/test parity); see [5. Pipelines](05_pipelines.md#data_validation).
+
+---
+[← 2. Infrastructure](02_infrastructure.md) · [Next: 4. Data layers and catalog →](04_data_layers.md)

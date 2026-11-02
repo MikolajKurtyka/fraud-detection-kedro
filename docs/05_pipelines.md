@@ -26,7 +26,7 @@ Useful variations:
 ```bash
 uv run kedro run --pipelines data_cleaning,feature_engineering   # make features
 uv run kedro run --pipelines training --params "lightgbm.model_options.n_trials=0,xgboost.model_options.n_trials=0,catboost.model_options.n_trials=0"   # make train-fast
-uv run kedro run --tags features            # by tag: ingestion | cleaning | features | training | lightgbm …
+uv run kedro run --tags features            # by tag: ingestion | validation | cleaning | features | training | evaluation | serving | lightgbm …
 uv run kedro run --pipelines training,evaluation --namespaces logreg,random_forest,hist_gb   # make baselines
 uv run kedro run --from-nodes fit_feature_encoders   # resume from a node
 uv run kedro viz run                        # interactive graph of everything below
@@ -51,6 +51,10 @@ flowchart TB
     subgraph L2["02_intermediate"]
         INT_TR[int_train]
         INT_TE[int_test]
+    end
+
+    subgraph P1b["data_validation"]
+        VAL["validate_data<br/>(pandera + parity)"]
     end
 
     subgraph P2["data_cleaning"]
@@ -91,6 +95,7 @@ flowchart TB
 
     RTT & RTI --> ING_TR --> INT_TR
     RST & RSI --> ING_TE --> INT_TE
+    INT_TR & INT_TE --> VAL --> VREP["data_validation.json<br/>(run stops on failure)"]
     INT_TR --> SPLIT -->|train_split| FITCF --> CF
     SPLIT -->|"train_split, valid_split"| APPCF
     INT_TE --> APPCF
@@ -105,7 +110,10 @@ flowchart TB
     TRAIN -->|model| CV --> REP
     TRAIN -->|model| REFIT --> MOD
 
-    MOD & MDL --> EVAL["evaluation<br/>precision / recall, curves,<br/>Kaggle submissions + blend"]
+    MOD & MDL --> EVAL["evaluation<br/>4 thresholds incl. min cost, curves,<br/>SHAP, Kaggle submissions + blend"]
+    EVAL -->|"{model}.evaluation<br/>(threshold, PR-AUC)"| SERVE["serving<br/>register_model"]
+    MOD & CF & FE --> SERVE
+    SERVE --> REG[("MLflow registry<br/>@champion")]
 ```
 
 Parallelogram nodes (`/…/`) are **fitted artifacts**. They are learned once from the train split
@@ -401,7 +409,43 @@ LightGBM the minimum is 0.077 at $2,764 per 1k transactions, against $3,147 at 1
 
 The best-F1 and min-cost thresholds are picked on valid itself, so their numbers are slightly
 optimistic. Registering the model with its threshold and moving `@champion` is done by the
-`serving` pipeline, see [7. Serving API](07_serving_api.md).
+`serving` pipeline (next section).
+
+---
+
+## serving
+
+**06_models + fitted artifacts + evaluation → MLflow registry.** One node, `register_model`. The
+model type is chosen by pipeline name: `serving` registers LightGBM, `serving_<model>` another type.
+
+```mermaid
+flowchart TB
+    M["{model}.model<br/>(train only)"] & CF[/column_filter/] & FE[/feature_encoders/] --> B["InferenceBundle"]
+    EV["{model}.evaluation"] --> T["threshold = evaluation[threshold_metric]<br/>score = evaluation[promotion_metric]"]
+    B & T --> L["mlflow.pyfunc.log_model(FraudPyfunc)<br/>→ new version of fraud-detection<br/>metadata + tags: threshold, cost_per_1k,<br/>model_type, pr_auc, training_run_id"]
+    L --> Q{"no @champion yet, or<br/>score > champion's score?"}
+    Q -->|yes| P["@champion → new version"]
+    Q -->|no| K["@champion kept"]
+    P & K --> R["serving_registration.json"]
+```
+
+| Node | Function | What it does |
+|---|---|---|
+| `register_{model}` | `register_model` | Fails early if `threshold_metric` is missing from the evaluation (run `make evaluate` first). Inside a kedro run: logs the bundle as an MLflow pyfunc, registers it as `fraud-detection`, tags the version, moves the alias if it wins. Outside a run (tests) it only returns the summary |
+
+**Parameters** (`parameters_serving.yml`):
+
+| Key | Value | Note |
+|---|---|---|
+| `registered_model_name` | `fraud-detection` | The name the API's `MODEL_URI` points to |
+| `alias` | `champion` | The alias the API serves |
+| `threshold_metric` | `min_cost_threshold` | Which evaluation threshold is stored with the model. Alternatives: `at_fpr_threshold`, `best_f1_threshold`, `fixed_threshold` |
+| `promotion_metric` | `pr_auc` | Must be *higher is better*: the comparison is `score > champion` |
+
+The registered model is the **train-only** `{model}.model`, so its threshold and metrics were
+measured on data it did not train on. Champion and challenger are compared on the scores stored
+when each was registered; that is fair only while the validation days stay the same (see
+[limitations](06_modeling_approach.md#known-limitations)).
 
 ---
 
@@ -410,11 +454,15 @@ optimistic. Registering the model with its threshold and moving `@champion` is d
 | Test file | Covers |
 |---|---|
 | `tests/pipelines/test_data_ingestion.py` | Range expansion, column renaming, dtype casting, schema-drift and bad-target errors, the join |
+| `tests/pipelines/test_data_validation.py` | Clean data passes; every failed check is reported; wrong dtype / extra column; time order and test-after-train; fraud rate range; null-rate drift; warn-only mode |
 | `tests/pipelines/test_data_cleaning.py` | Time ordering of the split, each filter rule, protected columns, single-row apply, missing-column error |
 | `tests/pipelines/test_feature_engineering.py` | Stateless features, native vs coded encodings, **single row = batch**, unseen values |
 | `tests/pipelines/test_training.py` | All six models train on CPU and score one row; class weights and undersampling (train only); refit tree count and `refit: false`; expanding CV folds; Optuna merges params; `n_trials=0` path |
-| `tests/pipelines/test_evaluation.py` | Threshold metrics, submission format, rank-average blend; the blend uses only boosting models and submissions use `final_model` |
-| `tests/api/test_api.py` | Liveness/readiness with and without a model, warm-up, single and batch scoring (order, size limits), threshold precedence, 422/500 error mapping, request-ID and timing headers, prediction log, `/metrics` |
+| `tests/pipelines/test_evaluation.py` | Threshold metrics; the min-cost threshold equals a brute-force search; SHAP values add up to the prediction; SHAP ranks the signal first; submission format, rank-average blend; the blend uses only boosting models and submissions use `final_model` |
+| `tests/test_inference.py` | `InferenceBundle` reproduces the batch model input and scores (single rows too); bad rows raise; the NumPy fast path equals the pandas path for every batch size and model type; pyfunc round trip; registration promotes only better models; `/explain` contributions add up to the score |
+| `tests/api/test_api.py` | Liveness/readiness with and without a model, warm-up, single and batch scoring (order, size limits), threshold precedence, 422/500 error mapping, request-ID and timing headers, prediction log, `/metrics`, `/explain` |
+| `tests/api/test_microbatch.py` | Off by default; concurrent requests share model calls; max batch size; one bad transaction does not fail the others; 503 without a model; the batcher survives a failing score function |
+| `tests/api/test_loadtest.py` | The load-test script in-process: bodies validate against the API schemas, overload drops requests, client shares cover the schedule once |
 
 ```bash
 uv run pytest      # make test
