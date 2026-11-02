@@ -205,9 +205,9 @@ def to_markdown(table: pd.DataFrame) -> str:
     return "\n".join(lines) + "\n"
 
 
-def plot_lines(table: pd.DataFrame, by: str, title: str):
-    fig, axes = plt.subplots(1, len(PANELS), figsize=(5 * len(PANELS), 4))
-    for ax, (col, panel_title) in zip(axes, PANELS, strict=True):
+def plot_lines(table: pd.DataFrame, by: str, title: str, panels=PANELS):
+    fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 4))
+    for ax, (col, panel_title) in zip(axes, panels, strict=True):
         for label, group in table.groupby(by):
             ax.plot(group["n_features"], group[col], marker="o", label=label)
         ax.set_title(panel_title)
@@ -226,7 +226,10 @@ def plot_all_models() -> None:
     ]
     tuned = pd.concat(tables).query("config == 'tuned'")
     path = REPORT_DIR / "feature_size_study_all.png"
-    fig = plot_lines(tuned, "model", "All models (tuned params) vs number of features")
+    # No e2e panel: models studied at different times may have been timed on different
+    # serving code, so their e2e numbers do not compare
+    panels = [p for p in PANELS if p[0] != "e2e_p50_ms"]
+    fig = plot_lines(tuned, "model", "All models (tuned params) vs number of features", panels)
     fig.savefig(path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {path}", flush=True)
