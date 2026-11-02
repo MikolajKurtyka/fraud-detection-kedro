@@ -5,7 +5,7 @@ DURATION ?= 60
 CLIENTS ?= 1
 WORKERS ?= 4
 
-.PHONY: help setup data ingest validate features train train-fast baselines evaluate register compare feature-study run viz mlflow api api-prod loadtest test lint format docker-up docker-down clean
+.PHONY: help setup data ingest validate features train train-fast baselines evaluate register compare feature-study serving-latency run viz mlflow api api-prod loadtest test lint format docker-up docker-down clean
 
 help:  ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -45,6 +45,9 @@ compare:  ## History of all trained models from MLflow as a table
 
 feature-study:  ## Accuracy, model size and serving latency vs number of features (top-N)
 	uv run python scripts/feature_size_study.py
+
+serving-latency:  ## Single-row latency of every saved model: pandas vs NumPy path, threads vs 1 thread
+	uv run python scripts/serving_latency.py
 
 run:  ## Run all pipelines
 	uv run kedro run
