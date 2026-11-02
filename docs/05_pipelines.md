@@ -11,12 +11,12 @@ nodes to catalog datasets and parameters). `pipeline_registry.py` registers them
 | Name | Status | Nodes | Run with |
 |---|---|---|---|
 | `data_ingestion` | Done | 8 (4 per split) | `kedro run --pipelines data_ingestion` (`make ingest`) |
-| `data_validation` | Planned, empty | 0 | — |
+| `data_validation` | Done | 1 | `kedro run --pipelines data_validation` (`make validate`) |
 | `data_cleaning` | Done | 5 | `kedro run --pipelines data_cleaning` |
 | `feature_engineering` | Done | 10 | `kedro run --pipelines feature_engineering` |
 | `training` | Done | 24 (4 per model, 6 models) | `kedro run --pipelines training` (`make train`) |
 | `training_lightgbm` / `_xgboost` / `_catboost` / `_logreg` / `_random_forest` / `_hist_gb` | Done | 4 | One model only. Not part of `__default__` |
-| `evaluation` | Done (metrics, curves, submissions); cost threshold / SHAP planned | 13 (2 per model + blend of the 3 boosting models) | `kedro run --pipelines evaluation` (`make evaluate`) |
+| `evaluation` | Done | 16 (2 per model, + SHAP for the 3 boosting models, + blend) | `kedro run --pipelines evaluation` (`make evaluate`) |
 | `serving` | Done | 1 | `kedro run --pipelines serving` (`make register`) |
 | `serving_xgboost` / `_catboost` / ... | Done | 1 | Register another model type. Not part of `__default__` |
 | `__default__` | — | all of the above except `training_*` / `serving_*` | `kedro run` (`make run`) |
@@ -185,10 +185,42 @@ flowchart LR
 
 ## data_validation
 
-*Planned (the pipeline is empty).* It will run pandera checks on `int_train` / `int_test` (types,
-value ranges, null rates per column group), check train/test column parity and `TransactionDT`
-ordering, and write a readable report to `08_reporting/data_validation.json`, failing fast when a
-check breaks.
+```mermaid
+flowchart LR
+    TR[int_train] & TE[int_test] --> V[validate_data]
+    P[/params:data_ingestion<br/>params:data_validation/] --> V
+    V --> R[data_validation_report<br/>08_reporting/data_validation.json]
+```
+
+One node, `validate_data`, checks both tables with a pandera schema built from the data_ingestion
+column types, then compares them. data_ingestion already fails on missing or unexpected columns
+and on a target outside {0, 1}; these checks cover the rest:
+
+| Check | Where | Rule |
+|---|---|---|
+| dtypes, no extra columns | both | Each column has its data_ingestion dtype (`strict=True`) |
+| `TransactionID` | both | int64, unique, never null |
+| Required columns | both | `required_columns` are never null (ID, time, amount, `ProductCD`) |
+| Value ranges | both | `value_ranges`: `TransactionDT >= 0`, `TransactionAmt > 0` |
+| `has_identity` | both | 0 or 1 |
+| Time order | both | `TransactionDT` sorted ascending |
+| Fraud rate | train | `isFraud` in {0, 1}, mean within `fraud_rate_range` (1–10%) |
+| Same columns and dtypes | parity | test = train without the target |
+| Test after train | parity | first test `TransactionDT` > last train `TransactionDT` |
+| Null rates | parity | \|null share test − null share train\| ≤ `max_null_rate_diff` (0.25) per column |
+
+Validation is lazy: every failed check is collected, then the node raises one
+`DataValidationError` listing all of them (column, check, number of failures, examples). With
+`fail_on_error: false` it logs a warning and continues. The report (row counts, fraud rate, the
+largest train/test null-rate difference) is written when the checks pass.
+
+On the Kaggle data every check passes in ~3 s. The largest null-rate difference is 0.14 (D13 and
+some V blocks), so the 0.25 limit only catches a real break, such as a column that went missing in
+one file.
+
+In `kedro run` the node runs as soon as both tables exist, in the same step as the time split and
+before anything is fitted, so a failure stops the run before the column filter, features or
+models.
 
 ---
 
@@ -334,13 +366,15 @@ flowchart LR
     P[/params:evaluation/] --> E
     E --> EJ["{model}.evaluation"]
     E --> EC["{model}.evaluation_curves"]
+    M & VA --> X["{model}.explain_model<br/>(boosting only)"] --> XS["{model}.shap_importance<br/>{model}.shap_plot"]
     FM["{model}.final_model<br/>(train + valid)"] & TE[mdl_in_test] --> S["{model}.predict_submission"] --> SUB["{model}.submission"]
     SUB -->|"lightgbm, xgboost, catboost only"| B[blend_submissions] --> BS[blend.submission]
 ```
 
 | Node | Function | What it does |
 |---|---|---|
-| `{model}.evaluate_model` | `evaluate_model` | On valid, with the **train-only** model: ROC-AUC, PR-AUC, fraud rate, plus precision, recall, F1, FPR and TP/FP/FN/TN at three thresholds. **fixed**: `fixed_threshold` (0.5). **best_f1**: the threshold that maximises F1 on valid. **at_fpr**: the threshold at which FPR = `target_fpr` (1%). Draws PR and ROC curves with the two chosen points marked. Writes everything as `eval_*` metrics and `evaluation_curves.png` into the model's **training** MLflow run |
+| `{model}.evaluate_model` | `evaluate_model` | On valid, with the **train-only** model: ROC-AUC, PR-AUC, fraud rate, plus precision, recall, F1, FPR, TP/FP/FN/TN and expected cost per 1k transactions at four thresholds. **fixed**: `fixed_threshold` (0.5). **best_f1**: the threshold that maximises F1 on valid. **at_fpr**: the threshold at which FPR = `target_fpr` (1%). **min_cost**: the threshold with the lowest expected cost (below). Draws PR, ROC and cost curves with the chosen points marked. Writes everything as `eval_*` metrics and `evaluation_curves.png` into the model's **training** MLflow run |
+| `{model}.explain_model` | `explain_model` | LightGBM, XGBoost and CatBoost only: SHAP values (exact TreeSHAP from the library, log-odds) on `shap.sample_size` valid rows; mean \|SHAP\| and mean SHAP per feature, a bar chart of the top `shap.top_n`. Both also go to the training MLflow run |
 | `{model}.predict_submission` | `predict_submission` | Scores all test rows with the **final** (refitted) model → `TransactionID, isFraud` |
 | `blend_submissions` | `blend_submissions` | Rank average (percentile ranks, mean, so the result is in 0–1) of the boosting submissions. Added only when ≥ 2 boosting models are in the pipeline; baselines stay out. Fails if the TransactionIDs don't match |
 
@@ -353,11 +387,20 @@ them the latest `stage = final` run of that model type is used.
 |---|---|---|
 | `fixed_threshold` | 0.5 | Reference only. Weighted or undersampled models score higher, so 0.5 means something different for them |
 | `target_fpr` | 0.01 | "How much fraud do we catch if we bother 1 in 100 legitimate customers?" |
+| `cost.amount_column` | `TransactionAmt` | What a missed fraud costs |
+| `cost.review_cost` | 5.0 | Per flagged transaction (analyst review or step-up check) |
+| `cost.false_block_cost` | 15.0 | Extra per flagged legitimate transaction (support call, lost sale) |
+| `shap.sample_size` / `random_state` / `top_n` | 5000 / 42 / 25 | SHAP sample from valid and features in the plot |
 
-The best-F1 threshold is picked on valid itself, so its numbers are slightly optimistic.
+**Cost-based threshold.** Cost at a threshold t = `Σ TransactionAmt of missed fraud +
+review_cost × flagged + false_block_cost × flagged legitimate`, where flagged means score ≥ t (as
+in the API). Every distinct valid score is a candidate (plus "flag nothing"); one sort and running
+sums give all totals at once. The cost figures are assumptions to agree with the business. For
+LightGBM the minimum is 0.077 at $2,764 per 1k transactions, against $3,147 at 1% FPR, $3,535 at
+0.5 and $5,156 with no model.
 
-**Still planned:** a cost-based threshold (`Σ missed fraud × TransactionAmt + Σ false alarms ×
-review_cost`) and SHAP importance. Registering the model and moving `@champion` is done by the
+The best-F1 and min-cost thresholds are picked on valid itself, so their numbers are slightly
+optimistic. Registering the model with its threshold and moving `@champion` is done by the
 `serving` pipeline, see [7. Serving API](07_serving_api.md).
 
 ---

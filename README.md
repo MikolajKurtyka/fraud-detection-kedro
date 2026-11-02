@@ -20,7 +20,7 @@ and a containerised FastAPI scoring service.
 |---|---|
 | Repo structure, setup scripts, Kaggle download with manifest | Done |
 | `data_ingestion` pipeline (typing per table, join, schema fix) | Done |
-| FastAPI service (`/predict`, `/predict/batch`, `/health/live`, `/health/ready`, Prometheus `/metrics`), Dockerfile, docker compose | Done |
+| FastAPI service (`/predict`, `/predict/batch`, `/explain`, `/health/live`, `/health/ready`, Prometheus `/metrics`), Dockerfile, docker compose | Done |
 | CI (lint, tests, Kedro load check, Docker build) | Done |
 | `data_cleaning` (time split, column filter fitted on train) | Done |
 | `feature_engineering` (time features, client UID, aggregations, encodings) | Done |
@@ -28,12 +28,14 @@ and a containerised FastAPI scoring service.
 | `evaluation`: precision / recall / F1 at 3 thresholds, PR + ROC curves, logged into MLflow | Done |
 | `evaluation`: Kaggle submissions per model + rank-average blend | Done (files written, not uploaded yet) |
 | Run history table from MLflow (`scripts/compare_runs.py`) | Done |
-| `evaluation`: cost-based threshold, SHAP | Planned |
+| `evaluation`: cost-based threshold (used by the API), global SHAP importance | Done |
 | Inference wrapper for the API (`InferenceBundle` + `FraudPyfunc` in `src/fraud_detection/inference.py`) | Done |
 | NumPy fast path for serving (`fast_inference.py`, ~2 ms per row, bit-identical to the pandas path) | Done |
 | Open-loop async load test, 1–10000 requests/min × 1–1000 rows (`make loadtest`) | Done |
 | `serving`: register the bundle in the MLflow registry, move `@champion` only if PR-AUC improves (`make register`) | Done |
-| `data_validation` (pandera schemas) | Planned |
+| `data_validation` (pandera schemas, train/test parity) | Done |
+| Per-prediction SHAP explanations (`POST /explain`) | Done |
+| Scheduled retraining (`.github/workflows/retrain.yml`) | Done; needs a hosted MLflow server and two secrets |
 
 ## Project Overview
 
@@ -91,11 +93,11 @@ GitHub Actions: lint → tests → Kedro load check → Docker image build
 | Pipeline | Input → Output | What it does |
 |---|---|---|
 | `data_ingestion` | `01_raw` → `02_intermediate` | Types each table against the schema in parameters (categorical / numerical, ID, optional target), fixes test column names (`id-01` → `id_01`), left-joins identity onto transactions, adds `has_identity` |
-| `data_validation` | `02_intermediate` → `08_reporting` | *Planned (empty):* schema, range and null-rate checks with pandera; train/test column parity |
+| `data_validation` | `02_intermediate` → `08_reporting` | pandera checks: dtypes, unique IDs, value ranges, required columns, time order, fraud rate; train/test parity (columns, dtypes, test after train, null rates). Stops the run if a check fails |
 | `data_cleaning` | `02` → `03_primary` | Time split (earlier 80% of days = train, rest = valid); drops near-empty, near-constant and correlated V columns with a filter fitted on train |
 | `feature_engineering` | `03` → `04_feature` → `05_model_input` | Time features, normalized D columns, email parts, client UID proxy, group-ratio / frequency / UID aggregates and category encodings fitted on train |
 | `training` | `05` → `06_models` | LightGBM, XGBoost (GPU), CatBoost (GPU), each with Optuna tuning, early stopping on valid, one nested MLflow run per model |
-| `evaluation` | `06` → `08_reporting` | Precision / recall / F1 at 3 thresholds, PR + ROC curves, Kaggle submissions per model + blend (planned: cost-based threshold, SHAP) |
+| `evaluation` | `06` → `08_reporting` | Precision / recall / F1 at 4 thresholds incl. the cost-optimal one, PR + ROC + cost curves, global SHAP importance (boosting models), Kaggle submissions per model + blend |
 | `serving` | `06` + fitted artifacts → MLflow registry | Wraps one model (LightGBM by default) with its column filter and encoders as an MLflow pyfunc, registers it as `fraud-detection`, moves `@champion` only if valid PR-AUC improves |
 
 **MLflow** (through `kedro-mlflow`) records parameters, metrics and artifacts for every `kedro run`
@@ -133,7 +135,7 @@ fraud-detection-kedro/
 │   ├── pipeline_registry.py
 │   └── settings.py
 ├── tests/
-├── .github/workflows/ci.yml
+├── .github/workflows/          # ci.yml (every push / PR), retrain.yml (weekly)
 ├── Dockerfile                     # API image (multi-stage, uv)
 ├── docker-compose.yml             # Postgres + MLflow + API
 ├── Makefile
@@ -220,6 +222,7 @@ All commands have a `make` shortcut (`make help`); on Windows without `make`, ru
 
 ```bash
 uv run kedro run --pipelines data_ingestion                      # make ingest
+uv run kedro run --pipelines data_validation                     # make validate
 uv run kedro run --pipelines data_cleaning,feature_engineering   # make features
 uv run kedro run --pipelines training                            # make train: 3 boosting models + Optuna, 3 baselines
 uv run kedro run                                                 # make run (all pipelines)
@@ -235,6 +238,7 @@ resume anywhere:
 ```bash
 uv run python scripts/download_data.py                           # 1. raw CSVs (once)
 uv run kedro run --pipelines data_ingestion                      # 2. typed + joined   (~30 s)
+uv run kedro run --pipelines data_validation                     #    pandera checks    (~5 s)
 uv run kedro run --pipelines data_cleaning,feature_engineering   # 3. split, filter, features (~2 min)
 uv run kedro run --pipelines training,evaluation                 # 4. tune + train all models, refit on train + valid, evaluate, submissions (up to ~3 h)
 uv run python scripts/compare_runs.py                            # 5. results table of all runs
@@ -279,11 +283,18 @@ On the valid split, per model:
 | `fixed_*` | 0.5 | What happens with the default cut-off? |
 | `best_f1_*` | the one that maximises F1 on valid | Best balance of precision and recall (slightly optimistic: picked on valid) |
 | `at_fpr_*` | where 1% of legitimate transactions get flagged | How much fraud is caught at a tolerable false-alarm rate? |
+| `min_cost_*` | the one with the lowest expected cost on valid | Which cut-off loses the least money? (see [Cost of a threshold](#cost-of-a-threshold)) |
 
-Each group has precision, recall, F1, FPR and the confusion-matrix counts (tp / fp / fn / tn).
-They are saved to `data/08_reporting/<model>_evaluation.json`, the PR and ROC curves to
-`data/08_reporting/<model>_curves.png`, and both are added to the model's MLflow run
-(metrics `eval_*`, artifact `evaluation_curves.png`).
+Each group has precision, recall, F1, FPR, the confusion-matrix counts (tp / fp / fn / tn) and
+`*_cost_per_1k`, the expected cost per 1,000 transactions (`no_model_cost_per_1k` is the cost of
+approving everything). They are saved to `data/08_reporting/<model>_evaluation.json`, the PR, ROC
+and cost curves to `data/08_reporting/<model>_curves.png`, and both are added to the model's
+MLflow run (metrics `eval_*`, artifact `evaluation_curves.png`). The serving pipeline stores the
+`min_cost` threshold with the registered model, so the API decides by cost.
+
+For LightGBM, XGBoost and CatBoost the evaluation also computes **SHAP** values on 5,000 valid rows
+(exact TreeSHAP from each library) and saves the mean |SHAP| per feature to
+`data/08_reporting/<model>_shap_importance.csv` and `<model>_shap.png` (also in the MLflow run).
 
 What these metrics mean in business terms, with blocks and losses per 10,000 transactions:
 [Metrics Explained](#metrics-explained-what-they-mean-for-the-business).
@@ -404,6 +415,16 @@ curl -X POST http://localhost:8000/predict \
 {"TransactionID": 3663549, "fraud_probability": 0.031, "is_fraud": false, "threshold": 0.42, "model_uri": "models:/fraud-detection@champion"}
 ```
 
+`POST /explain?top_k=5` takes the same body and adds the features that pushed this score up or
+down most (SHAP values in log-odds, ~110 ms per row, so it is kept off `/predict`):
+
+```json
+{"TransactionID": 2988500, "fraud_probability": 0.0026, "is_fraud": false, "threshold": 0.077,
+ "contributions": [{"feature": "V30", "value": 2.0, "shap": -0.358},
+                   {"feature": "card1_freq", "value": 0.0019, "shap": 0.223},
+                   {"feature": "card5", "value": "166", "shap": -0.218}, ...]}
+```
+
 Until a model is registered and given the `champion` alias, `/health` returns `"model_loaded": false` and `/predict` returns `503`.
 
 ### Tests and code quality
@@ -420,9 +441,12 @@ uv run ruff check .      # make lint
 1. **lint-test**: `uv sync --frozen` → ruff lint and format check → pytest with coverage → `kedro registry list` (checks the project loads)
 2. **docker**: builds the API image with layer caching (needs lint-test to pass)
 
-Planned: a scheduled retraining workflow that downloads data with the `KAGGLE_API_TOKEN` secret, runs the
-training and evaluation pipelines against a remote MLflow server, and moves the `champion` alias only if the
-challenger wins on the cost metric.
+`.github/workflows/retrain.yml` retrains every Monday (and on demand from the Actions tab): it downloads
+the data, runs ingestion, validation and features, tunes and trains LightGBM on the CPU, evaluates it and
+registers it on a remote MLflow server, moving `@champion` only if the new model beats the current one on
+valid PR-AUC. It needs the `KAGGLE_API_TOKEN` and `MLFLOW_TRACKING_URI` secrets (plus credentials if the
+server needs them) and skips with a notice without them. The MLflow server must serve artifacts, so the
+API can load what CI registered.
 
 ## Model Performance
 
@@ -567,7 +591,9 @@ before a threshold can be chosen.
 6. **Re-check over time**: fraud patterns drift, so the threshold chosen on one month of data does not stay optimal.
 
 These numbers come from the LightGBM baseline predictions on the valid split. The cost assumptions
-are illustrative. A `cost_threshold` node in the evaluation pipeline that computes this table on every run is still planned.
+are illustrative. The evaluation pipeline recomputes the cost-optimal threshold on every run with the costs in
+`conf/base/parameters_evaluation.yml` (`evaluation.cost`): for the same LightGBM it finds 0.077 at $2,764 per
+1k transactions ($27.6k per 10k), and the API uses that threshold.
 
 ## Model Card
 

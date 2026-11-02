@@ -46,20 +46,15 @@ every design decision in this project:
 ```mermaid
 flowchart LR
     A[Raw CSVs<br/>transaction + identity] --> B[data_ingestion<br/>type + join]
-    B --> C[data_cleaning<br/>time split + column filter]
+    B --> V[data_validation<br/>pandera checks]
+    V --> C[data_cleaning<br/>time split + column filter]
     C --> D[feature_engineering<br/>time, D-norm, UID,<br/>aggregates, encodings]
     D --> E[training<br/>LightGBM · XGBoost · CatBoost<br/>+ 3 baselines, Optuna, refit]
-    E --> F[evaluation<br/>thresholds, curves,<br/>submissions + blend]
-    F -.-> P[cost threshold,<br/>SHAP]
+    E --> F[evaluation<br/>thresholds, cost, SHAP,<br/>submissions + blend]
     F --> S[serving<br/>register bundle,<br/>promote if better]
     S --> G[(MLflow registry<br/>@champion)]
-    G --> H[FastAPI<br/>/predict · /predict/batch]
-
-    classDef planned stroke-dasharray: 5 5
-    class P planned
+    G --> H[FastAPI<br/>/predict · /predict/batch<br/>/explain]
 ```
-
-*The dashed box is planned and not implemented yet.*
 
 The key ideas:
 
@@ -86,13 +81,15 @@ The key ideas:
 | `data_cleaning`: time split, column filter fitted on train | Done |
 | `feature_engineering`: stateless features, encoders fitted on train, model input | Done |
 | `training`: LightGBM, XGBoost, CatBoost with Optuna + logreg / random forest / HistGB baselines; imbalance switch, optional time-series CV, refit on train + valid for submissions | Done (trained with base params; tuning not run yet) |
-| FastAPI service: `/predict`, `/predict/batch`, liveness/readiness, Prometheus `/metrics`, request IDs, prediction log; Dockerfile (multi-worker), docker compose | Done |
+| FastAPI service: `/predict`, `/predict/batch`, `/explain`, liveness/readiness, Prometheus `/metrics`, request IDs, prediction log; Dockerfile (multi-worker), docker compose | Done |
 | Inference wrapper `InferenceBundle` (raw rows → probability with the pipeline's own node functions) + `FraudPyfunc` (MLflow pyfunc) | Done |
 | CI: lint, tests, Kedro load check, Docker build | Done |
-| `data_validation` (pandera schemas, train/test parity) | Planned (pipeline is empty) |
+| `data_validation`: pandera schemas, train/test parity, stops the run on a failed check | Done |
 | `evaluation`: precision / recall / F1 at 3 thresholds, PR + ROC curves (logged into MLflow), Kaggle submission per model + blend | Done |
 | Scripts: run history from MLflow, feature-count study, API load test | Done |
-| `evaluation`: cost-based threshold, SHAP | Planned |
+| `evaluation`: cost-based threshold (stored with the model, used by the API), global SHAP importance | Done |
+| Per-prediction SHAP explanations (`POST /explain`) | Done |
+| Weekly retraining workflow against a remote MLflow | Done; needs a hosted MLflow server and secrets |
 | `serving`: register the inference bundle in the MLflow registry, move `@champion` only if valid PR-AUC improves (`make register`) | Done |
 
 **Latest results**: all models use their base `params` (no Optuna tuning yet). Validation is

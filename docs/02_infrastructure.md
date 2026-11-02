@@ -17,8 +17,8 @@ configuration, experiment tracking, containers and CI.
 | Reporting | matplotlib | PR and ROC curves per model (`{model}_curves.png`) |
 | Tuning | Optuna (TPE sampler) | Hyperparameter search on the time-based validation split |
 | Tracking | MLflow ≥ 2.17 via `kedro-mlflow` | Parameters, metrics, artifacts, model registry |
-| Validation (planned) | pandera | Schema and value-range checks |
-| Explainability (planned) | SHAP | Global and per-prediction explanations |
+| Validation | pandera | Schema, value-range and train/test parity checks (`data_validation`) |
+| Explainability | TreeSHAP (built into LightGBM / XGBoost / CatBoost) | Global importance per model, per-prediction explanations on `/explain` |
 | Serving | FastAPI, uvicorn, pydantic | REST scoring service |
 | Monitoring | `prometheus-fastapi-instrumentator`, `prometheus_client` | `/metrics`: request latency, prediction counts and probability histogram |
 | Containers | Docker, docker compose, Postgres 16 | Serving stack with an MLflow server |
@@ -45,7 +45,7 @@ flowchart TB
         PG[(Postgres<br/>metadata)]
         MF["MLflow server :5000<br/>tracking + registry"]
         ART[("volume<br/>mlflow-artifacts")]
-        API["FastAPI :8000<br/>/predict /predict/batch<br/>/health/* /metrics"]
+        API["FastAPI :8000<br/>/predict /predict/batch /explain<br/>/health/* /metrics"]
         MF --> PG
         MF --> ART
         API -->|"load models:/fraud-detection@champion"| MF
@@ -88,11 +88,11 @@ fraud-detection-kedro/
 ├── src/fraud_detection/
 │   ├── pipelines/
 │   │   ├── data_ingestion/            # nodes.py + pipeline.py per pipeline
-│   │   ├── data_validation/           # (planned, empty)
+│   │   ├── data_validation/           # pandera checks on int_train / int_test
 │   │   ├── data_cleaning/
 │   │   ├── feature_engineering/
 │   │   ├── training/                  # + model.py: FraudModel wrapper
-│   │   ├── evaluation/                # precision / recall, curves, Kaggle submissions
+│   │   ├── evaluation/                # thresholds incl. min cost, curves, SHAP, Kaggle submissions
 │   │   └── serving/                   # register the InferenceBundle in MLflow, move @champion
 │   ├── api/                           # main.py (FastAPI), schemas.py (pydantic), microbatch.py (optional)
 │   ├── fast_inference.py              # RecordScorer: NumPy fast path for the API (same scores)
@@ -101,7 +101,7 @@ fraud-detection-kedro/
 │   ├── pipeline_registry.py           # which pipelines exist
 │   └── settings.py                    # OmegaConfigLoader + oc.env resolver
 ├── tests/                             # mirrors src/: api/, pipelines/
-├── .github/workflows/ci.yml
+├── .github/workflows/          # ci.yml (every push / PR), retrain.yml (weekly)
 ├── Dockerfile                         # API image (multi-stage, uv)
 ├── docker-compose.yml                 # Postgres + MLflow + API
 ├── Makefile
@@ -271,8 +271,30 @@ flowchart LR
 Locally, pre-commit runs the same ruff checks plus trailing-whitespace, end-of-file, YAML and
 large-file (>1 MB) checks on every commit.
 
-Planned: a scheduled retraining workflow (download data with `KAGGLE_API_TOKEN` → train → evaluate
-against a remote MLflow → move `@champion` only if the challenger wins on the cost metric).
+### Scheduled retraining
+
+`.github/workflows/retrain.yml` runs every Monday at 03:00 UTC and on demand (`workflow_dispatch`,
+with the number of Optuna trials as input):
+
+```mermaid
+flowchart LR
+    A["download_data.py<br/>(KAGGLE_API_TOKEN)"] --> B["ingestion, validation,<br/>cleaning, features"]
+    B --> C["training_lightgbm<br/>(CPU, Optuna)"]
+    C --> D["evaluation<br/>(lightgbm namespace)"]
+    D --> E["serving: register on<br/>MLFLOW_TRACKING_URI"]
+    E -->|"PR-AUC beats champion"| F["@champion moves"]
+```
+
+| Secret | Required | Use |
+|---|---|---|
+| `KAGGLE_API_TOKEN` | yes | Data download |
+| `MLFLOW_TRACKING_URI` | yes | Remote MLflow server. It must serve artifacts (`mlflow server --serve-artifacts`), so the API can load what CI registered |
+| `MLFLOW_TRACKING_USERNAME` / `MLFLOW_TRACKING_PASSWORD` or `MLFLOW_TRACKING_TOKEN` | if the server needs them | Authentication |
+
+Without the two required secrets the job ends with a notice instead of failing. Only LightGBM is
+retrained: it is the served model, and GitHub runners have no GPU for XGBoost and CatBoost. The
+registration result goes to the job summary, and `data/08_reporting/` is uploaded as an artifact.
+The API picks up a new champion on its next restart.
 
 ## Makefile targets
 
@@ -281,11 +303,13 @@ against a remote MLflow → move `@champion` only if the challenger wins on the 
 | `make setup` | `scripts/setup.sh` | Install uv + deps, git hooks, `.env`, check Kaggle access |
 | `make data` | `download_data.py` | Download the Kaggle CSVs into `data/01_raw` |
 | `make ingest` | `kedro run --pipelines data_ingestion` | 01 → 02 |
+| `make validate` | `kedro run --pipelines data_validation` | pandera checks on 02 → `08_reporting/data_validation.json` |
 | `make features` | `… data_cleaning,feature_engineering` | 02 → 05 |
-| `make train` | `… training,evaluation` | Tune and train all models, evaluate, write submissions |
+| `make train` | `… training,evaluation,serving` | Tune and train all models, evaluate, write submissions, register LightGBM |
 | `make train-fast` | `… training,evaluation --params "*.n_trials=0"` | Same, once with the base params, no tuning |
 | `make baselines` | `… --namespaces logreg,random_forest,hist_gb` | Train and evaluate only the three baselines |
-| `make evaluate` | `kedro run --pipelines evaluation` | Metrics, curves and submissions for the saved models |
+| `make evaluate` | `kedro run --pipelines evaluation` | Metrics, cost threshold, curves, SHAP and submissions for the saved models |
+| `make register` | `kedro run --pipelines serving` | Register the saved LightGBM in MLflow; `@champion` moves if it beats the current one |
 | `make compare` | `scripts/compare_runs.py` | Run history table from MLflow |
 | `make feature-study` | `scripts/feature_size_study.py` | Accuracy, model size and latency vs number of features |
 | `make run` | `kedro run` | All pipelines (`__default__`) |

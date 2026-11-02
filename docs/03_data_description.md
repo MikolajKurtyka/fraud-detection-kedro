@@ -99,7 +99,7 @@ the schema in `conf/base/parameters_data_ingestion.yml`, and turns `315.0` into 
 
 | Challenge | Evidence | How the project handles it |
 |---|---|---|
-| Class imbalance | `isFraud` mean 0.035 (train split 0.0351, valid split 0.0344) | Ranking metrics (PR-AUC, ROC-AUC), no resampling, cost-based threshold (planned) |
+| Class imbalance | `isFraud` mean 0.035 (train split 0.0351, valid split 0.0344) | Ranking metrics (PR-AUC, ROC-AUC), no resampling, cost-based threshold |
 | Drift over time | `TransactionDT` covers ~182 days; test follows train. `D1`–`D15` grow with time | Time-based split; drop `TransactionDT`; `D_n_norm = day − D_n` |
 | Many nulls | 214 of 435 columns are more than half null; identity columns ≥76% null; `V` columns up to 86% null | NaN kept as is (trees route it), `has_identity` flag, drop only columns >99% null |
 | Redundant columns | The 339 `V` columns fall into 15 blocks with identical null shares, often highly correlated within a block | Per-block correlation filter (\|r\| > 0.95) → 56 `V` columns dropped |

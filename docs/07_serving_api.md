@@ -26,8 +26,9 @@ flowchart LR
    gives identical results and avoids re-hashing 100k-key dicts on every request.
 2. The `serving` pipeline (`make register`, also part of `make train`) wraps the bundle as an MLflow
    pyfunc and registers it as `fraud-detection`. It stores in the model metadata:
-   - the decision **threshold**: `serving.threshold_metric`, default `at_fpr_threshold` (~1% of
-     legitimate transactions flagged on valid);
+   - the decision **threshold**: `serving.threshold_metric`, default `min_cost_threshold` (the
+     lowest expected cost on valid, see `evaluation.cost`; `at_fpr_threshold` flags ~1% of
+     legitimate transactions instead), with its `cost_per_1k`;
    - the model type;
    - valid PR-AUC.
 3. `@champion` moves to the new version only if its `serving.promotion_metric` beats the current
@@ -70,6 +71,7 @@ dtype in the request, so a column mixing strings and floats keys `315.0` as `"31
 | `GET` | `/health` | `Health` | Back-compat, always 200 |
 | `POST` | `/predict` | `Prediction` | One transaction |
 | `POST` | `/predict/batch` | `list[Prediction]` | 1–1000 transactions, one model call, request order kept |
+| `POST` | `/explain?top_k=10` | `Explanation` | One transaction: the `Prediction` plus the `top_k` (1–50) features with the largest \|SHAP\|, each with its value (categories as labels) and SHAP value in log-odds. ~110 ms per row instead of ~2 ms, so it is a separate endpoint and `/predict` is unchanged. 501 if the model cannot explain |
 | `GET` | `/metrics` | Prometheus | HTTP metrics, `fraud_prediction_probability`, `fraud_predictions_total{model_version,is_fraud}` |
 | `GET` | `/docs` | Swagger UI | |
 

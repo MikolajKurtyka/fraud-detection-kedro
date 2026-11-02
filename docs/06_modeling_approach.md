@@ -33,7 +33,7 @@ A feature or setting that only helps under a random split is overfitting or leak
 | `class_weight` → each library's own setting | ✅ | LightGBM / sklearn `class_weight="balanced"`, XGBoost `scale_pos_weight = negatives / positives`, CatBoost `auto_class_weights="Balanced"` |
 | `undersample` → all fraud rows + `undersample_ratio` legit rows per fraud row, **train only** | ✅ | Valid, CV valid blocks and test always keep the true distribution. Also speeds up tuning |
 | No SMOTE | ✅ on purpose | Synthetic rows between neighbours rarely help tree models and don't make sense for IDs, codes and category columns |
-| Cost-based decision threshold | 🔜 | Minimise `FN × TransactionAmt + FP × review_cost` on valid, instead of using 0.5 |
+| Cost-based decision threshold | ✅ | Minimise missed fraud amounts + review and false-block costs on valid (`min_cost_threshold`); stored with the registered model and used by the API |
 | Recall at a fixed FPR (1%), plus precision / recall / F1 at 0.5 and at the best-F1 threshold | ✅ `evaluate_model` | "How much fraud do we catch if we bother 1 in 100 good customers?" LightGBM: 53.7% |
 
 ## 2. Many columns and nulls: an automated funnel
@@ -118,7 +118,8 @@ Fix drifting features where possible, and drop them only when you can't:
 | Watch the train–valid gap (`roc_auc_gap` in metrics) | ✅ | `train_model` |
 | Adversarial validation to find the remaining drifting features | 🔜 | see funnel step d |
 | Frequency encoding computed per period, or on train + test, if counts shift between periods | 🔜 | Trade-off: a single API row has no "period", so this needs a stored reference |
-| Monitoring in production (score distribution, feature PSI) and periodic retraining | 🔜 | |
+| Periodic retraining | ✅ | `.github/workflows/retrain.yml`, weekly; `@champion` moves only if PR-AUC improves |
+| Monitoring in production (score distribution, feature PSI) | 🔜 | The API already logs every prediction and exposes a score histogram |
 
 ## 4. Models and tuning
 

@@ -28,9 +28,8 @@
 ## Evaluation
 
 - **Split**: time-based (train on earlier days, validate on later days). A random split would leak future fraud patterns
-- **Metrics now**: PR-AUC (main), ROC-AUC, train–valid gap; precision / recall / F1 / FPR at 0.5, at the best-F1 threshold and at 1% FPR; PR and ROC curves
-- **Metrics planned**: expected cost per 1k transactions
-- **Threshold (planned)**: chosen to minimise `FN × TransactionAmt + FP × review_cost`. Until then, the API uses `FRAUD_THRESHOLD`, or the threshold stored with the model, or 0.5
+- **Metrics**: PR-AUC (main), ROC-AUC, train–valid gap; precision / recall / F1 / FPR and expected cost per 1k transactions at 0.5, at the best-F1 threshold, at 1% FPR and at the cost-optimal threshold; PR, ROC and cost curves
+- **Threshold**: the one with the lowest expected cost on valid: missed fraud costs its `TransactionAmt`, every flagged transaction $5 (review), every flagged good customer $15 more. For LightGBM: 0.077, $2,764 per 1k transactions vs $5,156 with no model. The costs are assumptions to agree with the business. The threshold is stored with the registered model; `FRAUD_THRESHOLD` overrides it
 
 **Results**: base parameters (Optuna tuning not run yet), validation on days 141–182:
 
@@ -55,8 +54,8 @@ validation split, and the best-F1 threshold was chosen on it too (see
 
 - Now: feature importance per model (`data/08_reporting/{model}_feature_importance.csv`, also logged to MLflow): gain for boosting, impurity for random forest, permutation on valid for logistic regression and HistGB
 - Monitoring: the API logs every prediction as JSON and exposes a probability histogram on `/metrics`, both inputs for drift checks
-- Planned global: SHAP feature importance, logged to MLflow per run
-- Planned local: SHAP values per prediction (an API option)
+- Global: mean |SHAP| per feature on 5,000 valid rows for each boosting model (`data/08_reporting/{model}_shap_importance.csv`, also in MLflow). LightGBM's top features: C13, D1_norm, card1_freq, card6, D4_norm, TransactionAmt
+- Local: `POST /explain` returns the features that pushed one transaction's score up or down most (SHAP values in log-odds)
 
 ## Limitations and Risks
 
