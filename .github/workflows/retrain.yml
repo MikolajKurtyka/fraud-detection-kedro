@@ -1,0 +1,88 @@
+name: Retrain
+
+# Weekly retraining of the served model (LightGBM, CPU) against a remote MLflow server.
+# @champion moves to the new version only if it beats the current champion on valid
+# (serving.promotion_metric), so a worse model never reaches the API.
+#
+# Needs repository secrets:
+#   KAGGLE_API_TOKEN      Kaggle API token (scripts/download_data.py)
+#   MLFLOW_TRACKING_URI   remote MLflow server, e.g. https://mlflow.example.com; it must serve
+#                         artifacts (mlflow server --serve-artifacts) so the API can load models
+# Optional: MLFLOW_TRACKING_USERNAME / MLFLOW_TRACKING_PASSWORD or MLFLOW_TRACKING_TOKEN.
+# Without the two required secrets the job is skipped with a notice.
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # Mondays 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      n_trials:
+        description: Optuna trials for LightGBM (0 = base params)
+        default: "25"
+
+concurrency:
+  group: retrain
+  cancel-in-progress: false
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+      MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+      MLFLOW_TRACKING_USERNAME: ${{ secrets.MLFLOW_TRACKING_USERNAME }}
+      MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
+      MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+      KEDRO_DISABLE_TELEMETRY: "1"
+      N_TRIALS: ${{ inputs.n_trials || '25' }}
+    steps:
+      - name: Check secrets
+        id: secrets
+        run: |
+          if [ -z "$KAGGLE_API_TOKEN" ] || [ -z "$MLFLOW_TRACKING_URI" ]; then
+            echo "::notice::KAGGLE_API_TOKEN or MLFLOW_TRACKING_URI is not set; skipping retraining."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.secrets.outputs.ready == 'true'
+      - uses: astral-sh/setup-uv@v6
+        if: steps.secrets.outputs.ready == 'true'
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        if: steps.secrets.outputs.ready == 'true'
+        run: uv sync --frozen
+
+      - name: Download data
+        if: steps.secrets.outputs.ready == 'true'
+        run: uv run python scripts/download_data.py
+
+      - name: Ingest, validate, clean, build features
+        if: steps.secrets.outputs.ready == 'true'
+        run: uv run kedro run --pipelines data_ingestion,data_validation,data_cleaning,feature_engineering
+
+      - name: Train LightGBM
+        if: steps.secrets.outputs.ready == 'true'
+        run: uv run kedro run --pipelines training_lightgbm --params "lightgbm.model_options.n_trials=$N_TRIALS"
+
+      - name: Evaluate (metrics, cost threshold, SHAP)
+        if: steps.secrets.outputs.ready == 'true'
+        run: uv run kedro run --pipelines evaluation --namespaces lightgbm
+
+      - name: Register, promote if better
+        if: steps.secrets.outputs.ready == 'true'
+        run: |
+          uv run kedro run --pipelines serving
+          { echo '```json'; cat data/08_reporting/serving_registration.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports
+        if: always() && steps.secrets.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: data/08_reporting/
+          if-no-files-found: ignore
