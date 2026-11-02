@@ -32,6 +32,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # The API loads its model once at startup, so it must not start before MLflow answers
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
 
   api:
     build: .
@@ -48,7 +55,8 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      - mlflow
+      mlflow:
+        condition: service_healthy
 
 volumes:
   postgres-data:
