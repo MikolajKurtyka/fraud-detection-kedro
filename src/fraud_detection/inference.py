@@ -4,7 +4,8 @@
 the parameters they were fitted with. ``predict_proba`` chains the same node functions as
 data_ingestion -> data_cleaning -> feature_engineering, so serving cannot drift from
 training. ``predict_records`` is the fast path the API uses: the same features on NumPy arrays
-(see ``fast_inference``), tested to give the same scores. ``FraudPyfunc`` wraps a bundle as an
+(see ``fast_inference``), tested to give the same scores. ``explain_records`` adds per-row
+SHAP values on the same path. ``FraudPyfunc`` wraps a bundle as an
 MLflow pyfunc model for the registry and API.
 """
 
@@ -151,6 +152,24 @@ class InferenceBundle:
         """Fast path: raw rows as dicts (one or many) -> the same scores as ``predict_proba``."""
         return self._scorer.predict(records)
 
+    def explain_records(self, records: list[dict], top_k: int = 10) -> list[list[dict]]:
+        """Per row, the ``top_k`` features with the largest |SHAP| (log-odds), largest first,
+        with the model input value each one had (categories as labels, not codes)."""
+        scorer = self._scorer
+        values, X = scorer.shap_values(records)
+        top = np.argsort(-np.abs(values), axis=1, kind="stable")[:, :top_k]
+        return [
+            [
+                {
+                    "feature": scorer.features[j],
+                    "value": scorer.label(scorer.features[j], X[i, j]),
+                    "shap": float(values[i, j]),
+                }
+                for j in row
+            ]
+            for i, row in enumerate(top)
+        ]
+
 
 class FraudPyfunc(mlflow.pyfunc.PythonModel):
     """MLflow wrapper: ``predict(raw rows) -> fraud probabilities``.
@@ -170,3 +189,7 @@ class FraudPyfunc(mlflow.pyfunc.PythonModel):
         if isinstance(model_input, pd.DataFrame):
             return self.bundle.predict_proba(model_input)
         return self.bundle.predict_records(model_input)
+
+    def explain(self, records: list[dict], top_k: int = 10) -> list[list[dict]]:
+        """Top SHAP contributions per row (see ``InferenceBundle.explain_records``)."""
+        return self.bundle.explain_records(records, top_k)

@@ -336,3 +336,37 @@ def test_register_promotes_only_better_models(fitted, tmp_path, monkeypatch):
         np.testing.assert_array_equal(loaded.predict(records), bundle.predict_records(records))
     finally:
         mlflow.set_tracking_uri(None)
+
+
+def test_explanations_add_up_to_the_fast_path_score(fitted):
+    bundle, raw, _ = fitted
+    records = _api_records(raw)[:20]
+    values, _ = bundle._scorer.shap_values(records)
+    base = bundle.model.estimator.booster_.predict(
+        bundle._scorer.feature_matrix(records), pred_contrib=True
+    )[:, -1]
+    log_odds = values.sum(axis=1) + base
+    np.testing.assert_allclose(
+        1 / (1 + np.exp(-log_odds)), bundle.predict_records(records), atol=1e-9
+    )
+
+
+def test_explain_records_top_features(fitted):
+    bundle, raw, _ = fitted
+    records = _api_records(raw)[:5]
+    explanations = bundle.explain_records(records, top_k=3)
+    assert len(explanations) == len(records)
+    features = set(bundle.model.feature_columns)
+    for contributions in explanations:
+        assert len(contributions) == 3
+        assert {c["feature"] for c in contributions} <= features
+        shap = [abs(c["shap"]) for c in contributions]
+        assert shap == sorted(shap, reverse=True)
+    # Native categories come back as labels, not codes
+    native = [
+        c
+        for row in bundle.explain_records(records, top_k=len(features))
+        for c in row
+        if c["feature"] in bundle._scorer.native and c["value"] is not None
+    ]
+    assert native and all(isinstance(c["value"], str) for c in native)

@@ -30,6 +30,16 @@ class FakeModel:
         amt = [r.get("TransactionAmt", 0) for r in records]
         return np.clip(np.asarray(amt, dtype=float) / 100, 0, 1)
 
+    def explain(self, records, top_k):
+        """Two fixed contributions per row; the amount pushes towards fraud."""
+        if any("boom" in r for r in records):
+            raise ValueError("bad column boom")
+        contributions = [
+            {"feature": "TransactionAmt", "value": records[0].get("TransactionAmt"), "shap": 1.5},
+            {"feature": "ProductCD", "value": "W", "shap": -0.2},
+        ]
+        return [contributions[:top_k] for _ in records]
+
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
@@ -208,3 +218,27 @@ def test_metrics_endpoint(fake_model):
     assert "fraud_prediction_probability_bucket" in resp.text
     assert 'fraud_predictions_total{is_fraud="true",model_version="7"}' in resp.text
     assert "http_request_duration" in resp.text
+
+
+def test_explain_returns_prediction_and_contributions(fake_model):
+    with TestClient(app) as client:
+        resp = client.post("/explain?top_k=1", json=tx(5, 50))
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["fraud_probability"] == 0.5
+    assert body["is_fraud"] is True
+    assert body["contributions"] == [{"feature": "TransactionAmt", "value": 50.0, "shap": 1.5}]
+
+
+def test_explain_errors(fake_model, monkeypatch):
+    with TestClient(app) as client:
+        assert client.post("/explain?top_k=0", json=tx(1, 5)).status_code == 422
+        assert client.post("/explain", json=tx(1, 5, boom=1)).status_code == 422
+    monkeypatch.delattr(FakeModel, "explain")
+    with TestClient(app) as client:
+        assert client.post("/explain", json=tx(1, 5)).status_code == 501
+
+
+def test_explain_503_without_model(no_model):
+    with TestClient(app) as client:
+        assert client.post("/explain", json=tx(1, 5)).status_code == 503

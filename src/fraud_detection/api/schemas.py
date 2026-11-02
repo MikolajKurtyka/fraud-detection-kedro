@@ -42,6 +42,16 @@ class Prediction(BaseModel):
     model_uri: str
 
 
+class Contribution(BaseModel):
+    feature: str  # model feature (after feature engineering), e.g. TransactionAmt_to_mean_card1
+    value: float | str | None  # its value for this transaction; categories as labels
+    shap: float  # contribution to the fraud score in log-odds; > 0 pushes towards fraud
+
+
+class Explanation(Prediction):
+    contributions: list[Contribution]  # largest |shap| first
+
+
 class Liveness(BaseModel):
     status: str
 

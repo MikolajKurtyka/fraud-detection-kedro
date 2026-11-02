@@ -10,6 +10,9 @@ Scaling: run several worker processes (``--workers`` / ``WEB_CONCURRENCY``); sco
 so threads or async alone do not add throughput. Optional micro-batching of ``/predict``
 (``MICROBATCH_WAIT_MS`` > 0, off by default) scores concurrent requests in one model call.
 
+``/explain`` returns the prediction plus the features that pushed the score up or down most
+(SHAP values from the same fast path). It costs a few ms per row, so it is a separate endpoint.
+
 Run locally:  uv run uvicorn fraud_detection.api.main:app --reload
               make api-prod WORKERS=8                       (several workers, no reload)
 """
@@ -26,13 +29,20 @@ from functools import partial
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from prometheus_client import Counter, Histogram
 from prometheus_fastapi_instrumentator import Instrumentator
 from starlette.concurrency import run_in_threadpool
 
 from .microbatch import MicroBatcher
-from .schemas import Health, Liveness, Prediction, Transaction, TransactionBatch
+from .schemas import (
+    Explanation,
+    Health,
+    Liveness,
+    Prediction,
+    Transaction,
+    TransactionBatch,
+)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -311,3 +321,26 @@ async def predict(tx: Transaction, request: Request) -> Prediction:
 def predict_batch(txs: TransactionBatch, request: Request) -> list[Prediction]:
     """Score up to 1000 transactions in one model call; results keep the request order."""
     return _score(request, txs)
+
+
+@app.post("/explain", response_model=Explanation)
+def explain(tx: Transaction, request: Request, top_k: int = Query(10, ge=1, le=50)) -> Explanation:
+    """Score one transaction and return the ``top_k`` features with the largest SHAP values."""
+    state = _service(request)
+    prediction = _score(request, [tx])[0]
+    pyfunc = state.model.pyfunc
+    # The registered pyfunc wraps FraudPyfunc; explain() lives on that inner model
+    python_model = (
+        pyfunc.unwrap_python_model() if hasattr(pyfunc, "unwrap_python_model") else pyfunc
+    )
+    if not hasattr(python_model, "explain"):
+        raise HTTPException(status_code=501, detail="This model cannot explain predictions.")
+    record = {**tx.features, "TransactionID": tx.TransactionID}
+    try:
+        contributions = python_model.explain([record], top_k)[0]
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid input: {exc}") from exc
+    except Exception as exc:
+        logger.exception("Explanation failed")
+        raise HTTPException(status_code=500, detail="Explanation failed.") from exc
+    return Explanation(**prediction.model_dump(), contributions=contributions)

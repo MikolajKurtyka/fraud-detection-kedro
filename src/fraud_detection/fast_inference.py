@@ -15,6 +15,7 @@ Kept identical to the pandas path on purpose:
 """
 
 import math
+from functools import cached_property
 
 import numpy as np
 import pandas as pd
@@ -105,16 +106,47 @@ class RecordScorer:
             X[:, j] = batch.feature(name)
         return X
 
-    def predict(self, records: list[dict]) -> np.ndarray:
-        X = self.feature_matrix(records)
-        if self.model.model_type == "lightgbm":
-            return self.model.estimator.booster_.predict(X)
-        # Other libraries get the DataFrame they were fitted on, with category dtypes
+    def _frame(self, X: np.ndarray) -> pd.DataFrame:
+        """The DataFrame the other libraries were fitted on, with category dtypes."""
         frame = pd.DataFrame(X, columns=self.features)
         for col in self.model.categorical_columns:
             codes = np.nan_to_num(frame[col].to_numpy(), nan=-1).astype("int64")
             frame[col] = pd.Categorical.from_codes(codes, categories=self.native[col])
-        return self.model.predict_proba(frame)
+        return frame
+
+    def predict(self, records: list[dict]) -> np.ndarray:
+        X = self.feature_matrix(records)
+        if self.model.model_type == "lightgbm":
+            return self.model.estimator.booster_.predict(X)
+        return self.model.predict_proba(self._frame(X))
+
+    @cached_property
+    def _code_labels(self) -> dict[str, dict[int, str]]:
+        return {
+            col: {code: key for key, code in codes.items()} for col, codes in self.coded.items()
+        }
+
+    def label(self, name: str, value: float) -> float | str | None:
+        """A model input value as a person reads it: category codes back to the category."""
+        if math.isnan(value):
+            return None
+        if name in self.native:
+            return str(self.native[name][int(value)])
+        if name in self.coded:
+            return self._code_labels[name].get(int(value))
+        return float(value)
+
+    def shap_values(self, records: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+        """SHAP values (rows x model features, log-odds) and the model input they explain.
+
+        Only on request: TreeSHAP costs a few ms per row, far more than the prediction.
+        """
+        X = self.feature_matrix(records)
+        if self.model.model_type == "lightgbm":
+            values = self.model.estimator.booster_.predict(X, pred_contrib=True)
+        else:
+            values = self.model.shap_values(self._frame(X))
+        return values[:, :-1], X
 
 
 class _Batch:
