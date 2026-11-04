@@ -1,7 +1,8 @@
-"""Nodes for the production pipeline: the chosen config, a holdout cut from valid, its report.
+"""Nodes for the production pipeline: candidates, a holdout cut from valid, the choice.
 
-Training, evaluation, refit, submission and registration reuse the research nodes; only
-the feature selection, the holdout split and the holdout report are new here.
+Each candidate (model type + top-N features) reuses the research training, evaluation, refit
+and submission nodes; new here are the feature selection, the holdout split and report, and
+the choice of one candidate for the API and Kaggle.
 """
 
 import logging
@@ -14,13 +15,15 @@ from mlflow import MlflowClient
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from fraud_detection.pipelines.evaluation.nodes import _at_threshold
+from fraud_detection.pipelines.serving.nodes import register_model
 from fraud_detection.pipelines.training.model import FraudModel
 
 logger = logging.getLogger(__name__)
 
 
-def select_features(feature_importance: pd.DataFrame, n_features: int | None) -> list[str]:
-    """The top ``n_features`` of the research model's importance; all of them when None."""
+def select_features(feature_importance: pd.DataFrame, candidate: dict) -> list[str]:
+    """The top ``candidate["n_features"]`` of the research model's importance (None = all)."""
+    n_features = candidate.get("n_features")
     ranked = feature_importance.sort_values("importance", ascending=False, kind="stable")
     features = ranked["feature"].tolist()
     if n_features is not None:
@@ -58,12 +61,22 @@ def split_holdout(
 
 
 def production_options(
-    model_options: dict, research_params: dict, production_params: dict
+    model_options: dict, research_params: dict, production_params: dict, candidate: dict
 ) -> tuple[dict, dict]:
-    """Research model_options and tuned params, plus ``param_overrides``, under its own run."""
+    """Research model_options and tuned params, plus the global and the candidate's
+    ``param_overrides``, under its own MLflow run (production-<model>-<n_features>)."""
     model_type = model_options["model_type"]
-    options = {**model_options, "run_name": f"production-{model_type}", "stage": "production"}
-    params = {**research_params, **(production_params.get("param_overrides") or {})}
+    size = candidate.get("n_features") or "all"
+    options = {
+        **model_options,
+        "run_name": f"production-{model_type}-{size}",
+        "stage": "production",
+    }
+    params = {
+        **research_params,
+        **(production_params.get("param_overrides") or {}),
+        **(candidate.get("param_overrides") or {}),
+    }
     return options, params
 
 
@@ -146,3 +159,133 @@ def evaluate_holdout(
         holdout_metrics["latency_p99_ms"],
     )
     return {**evaluation, **holdout_metrics}
+
+
+# Report column -> number format
+_REPORT = {
+    "n_features": "{:d}",
+    "holdout_pr_auc": "{:.4f}",
+    "holdout_roc_auc": "{:.4f}",
+    "holdout_cost_per_1k": "{:.0f}",
+    "latency_p50_ms": "{:.2f}",
+    "latency_p99_ms": "{:.2f}",
+}
+
+
+def choose_candidate(candidates: dict, selection: dict, **evaluations: dict) -> tuple[dict, str]:
+    """Pick the API + Kaggle model among the candidates, on their holdout reports.
+
+    1. Keep the candidates within the latency budget (one-row p99 <= max_latency_p99_ms;
+       null = no budget). If none is, keep all of them and warn.
+    2. Take the best holdout PR-AUC among them; every candidate within pr_auc_tolerance of
+       it counts as equally good.
+    3. Of those, the fewest features (then the higher PR-AUC).
+
+    Returns the choice and a Markdown table of every candidate.
+    """
+    table = pd.DataFrame(
+        [
+            {
+                "candidate": name,
+                "model": candidates[name]["model"],
+                "n_features": int(ev["n_features"]),
+                **{key: float(ev[key]) for key in list(_REPORT)[1:]},
+            }
+            for name, ev in evaluations.items()
+        ]
+    )
+    budget, tolerance = selection.get("max_latency_p99_ms"), selection["pr_auc_tolerance"]
+    table["fast_enough"] = True if budget is None else table["latency_p99_ms"] <= budget
+    pool = table[table["fast_enough"]]
+    if pool.empty:
+        logger.warning("No candidate has one-row p99 <= %s ms; choosing among all", budget)
+        pool = table
+    best = pool.loc[pool["holdout_pr_auc"].idxmax()]
+    near = pool[pool["holdout_pr_auc"] >= best["holdout_pr_auc"] - tolerance]
+    chosen = near.sort_values(
+        ["n_features", "holdout_pr_auc"], ascending=[True, False], kind="stable"
+    ).iloc[0]
+
+    choice = {
+        "candidate": str(chosen["candidate"]),
+        "model": str(chosen["model"]),
+        "n_features": int(chosen["n_features"]),
+        "holdout_pr_auc": float(chosen["holdout_pr_auc"]),
+        "latency_p99_ms": float(chosen["latency_p99_ms"]),
+        "best_candidate": str(best["candidate"]),
+        "best_holdout_pr_auc": float(best["holdout_pr_auc"]),
+        "max_latency_p99_ms": budget,
+        "pr_auc_tolerance": tolerance,
+        "any_fast_enough": bool(table["fast_enough"].any()),
+    }
+    logger.info(
+        "Production choice: %s (%d features, holdout PR-AUC %.4f, p99 %.2f ms); "
+        "best PR-AUC: %s %.4f",
+        choice["candidate"],
+        choice["n_features"],
+        choice["holdout_pr_auc"],
+        choice["latency_p99_ms"],
+        choice["best_candidate"],
+        choice["best_holdout_pr_auc"],
+    )
+    return choice, _candidates_markdown(table, choice)
+
+
+def _candidates_markdown(table: pd.DataFrame, choice: dict) -> str:
+    budget = choice["max_latency_p99_ms"]
+    columns = ["candidate", "model", *_REPORT, "fast_enough", "chosen"]
+    lines = [
+        "# Production candidates",
+        "",
+        "Holdout = the later part of valid: nothing was fitted, early-stopped or picked on it.",
+        f"Rule: one-row p99 <= {'any' if budget is None else budget} ms, then the best holdout "
+        f"PR-AUC; of the candidates within {choice['pr_auc_tolerance']} of it, the fewest "
+        "features.",
+        "",
+        "| " + " | ".join(columns) + " |",
+        "|" + "---|" * len(columns),
+    ]
+    for row in table.sort_values("holdout_pr_auc", ascending=False).to_dict("records"):
+        cells = [row["candidate"], row["model"]]
+        cells += [fmt.format(row[key]) for key, fmt in _REPORT.items()]
+        cells += [
+            "yes" if row["fast_enough"] else "no",
+            "**yes**" if row["candidate"] == choice["candidate"] else "",
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
+    if not choice["any_fast_enough"]:
+        lines += ["", f"No candidate met the {budget} ms budget; chosen among all of them."]
+    return "\n".join(lines) + "\n"
+
+
+def register_chosen(
+    choice: dict,
+    column_filter: dict,
+    feature_encoders: dict,
+    ingestion_params: dict,
+    feature_params: dict,
+    target: str,
+    serving_params: dict,
+    validation_params: dict,
+    **candidates: object,
+) -> dict:
+    """Register the chosen candidate's train-only model; @champion moves only if it beats
+    the current champion. ``candidates`` holds ``<name>__model`` and ``<name>__evaluation``."""
+    name = choice["candidate"]
+    return register_model(
+        candidates[f"{name}__model"],
+        candidates[f"{name}__evaluation"],
+        column_filter,
+        feature_encoders,
+        ingestion_params,
+        feature_params,
+        target,
+        serving_params,
+        validation_params,
+        extra_metadata={"candidate": name, "n_features": choice["n_features"]},
+    )
+
+
+def copy_submission(choice: dict, **submissions: pd.DataFrame) -> pd.DataFrame:
+    """The chosen candidate's Kaggle file, saved again as submission_production.csv."""
+    return submissions[choice["candidate"]]

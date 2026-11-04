@@ -169,19 +169,39 @@ feature_encoders:
     kedro-viz:
       layer: reporting
 
-# ---------- production: the one model for Kaggle and the API ----------
-# Other production outputs reuse the {model}.* entries above with model = "production":
-# production.pkl, production_final.pkl, production_best_params.json, production_evaluation.json
-# (valid + holdout_* metrics), submission_production.csv, ...
-# The top-N feature names the production model was trained on
-production.features:
+# ---------- production: candidates, and the one model for Kaggle and the API ----------
+# Candidate outputs reuse the {model}.* entries above with model = "production_<name>":
+# production_<name>.pkl, production_<name>_final.pkl, production_<name>_evaluation.json
+# (valid + holdout_* metrics), submission_production_<name>.csv, ...
+# The top-N feature names a candidate was trained on
+"{model}.features":
   type: json.JSONDataset
-  filepath: data/06_models/production_features.json
+  filepath: data/06_models/{model}_features.json
   save_args:
     indent: 2
   metadata:
     kedro-viz:
       layer: models
+
+# Which candidate was chosen, and why; the table of all candidates
+production.choice:
+  type: json.JSONDataset
+  filepath: data/08_reporting/production_choice.json
+  save_args:
+    indent: 2
+  metadata:
+    kedro-viz:
+      layer: reporting
+
+production.candidates_report:
+  type: text.TextDataset
+  filepath: data/08_reporting/production_candidates.md
+  metadata:
+    kedro-viz:
+      layer: reporting
+
+# production.submission (the chosen candidate's file) uses {model}.submission:
+# data/07_model_output/submission_production.csv, the file to upload to Kaggle
 
 # What the production pipeline registered in MLflow (version, threshold, promoted)
 serving_registration:

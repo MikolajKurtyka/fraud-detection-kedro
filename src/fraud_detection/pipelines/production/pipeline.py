@@ -1,49 +1,67 @@
 """production: research outputs + 05_model_input -> the Kaggle submission and the API model.
 
 The research pipelines (training, evaluation) compare every model on all features. This one
-takes one model type with its tuned params (``{model}.best_params``) and its top-N features
-(``{model}.feature_importance``), and builds the single model used for both outputs:
+builds a few **candidates** (``production.candidates``: a model type with its research tuned
+params, ``{model}.best_params``, on its top-N research features, ``{model}.feature_importance``)
+and chooses one of them for both outputs.
+
+Per candidate (namespace ``production_<name>``, e.g. production_xgboost_200.pkl):
 
 1. Cut valid by time into valid (early stopping, threshold) and a holdout nothing is fitted
-   or picked on; holdout metrics are the honest ones and decide the promotion.
+   or picked on.
 2. Train on train with the chosen features, evaluate on valid, report on the holdout.
-3. Refit on all labelled data -> submission_production.csv for Kaggle.
-4. Register the train-only model (its threshold was picked for it) -> @champion if better.
+3. Refit on all labelled data -> submission_production_<name>.csv.
 
-Datasets live under the ``production`` namespace (production.model, production.evaluation,
-...). The model type is chosen at pipeline level: ``production`` uses LightGBM,
-``production_<model>`` the others.
+Then ``choose_candidate`` applies ``production.selection`` to the holdout reports (latency
+budget, best PR-AUC, fewest features within a tolerance), registers the chosen train-only
+model (@champion moves only if it beats the champion) and copies its submission to
+submission_production.csv.
 """
 
 from kedro.pipeline import Pipeline, node, pipeline
 
 from fraud_detection.pipelines.evaluation.nodes import evaluate_model, predict_submission
-from fraud_detection.pipelines.serving.nodes import register_model
 from fraud_detection.pipelines.training.nodes import refit_model, train_model
 
 from .nodes import (
+    choose_candidate,
+    copy_submission,
     evaluate_holdout,
     production_options,
+    register_chosen,
     select_features,
     split_holdout,
     subset_columns,
 )
 
 _COMMON = ["params:target", "params:feature_engineering.join_key"]
+_SHARED_PARAMS = [
+    "params:production",
+    "params:production.holdout_fraction",
+    "params:evaluation",
+    "params:serving",
+    "params:feature_engineering.join_key",
+    "params:target",
+]
 
 
-def _production_pipeline() -> Pipeline:
+def _candidate_pipeline() -> Pipeline:
     return Pipeline(
         [
             node(
                 select_features,
-                inputs=["research_importance", "params:production.n_features"],
+                inputs=["research_importance", "params:candidate"],
                 outputs="features",
                 name="select_features",
             ),
             node(
                 production_options,
-                inputs=["params:model_options", "research_params", "params:production"],
+                inputs=[
+                    "params:model_options",
+                    "research_params",
+                    "params:production",
+                    "params:candidate",
+                ],
                 outputs=["options", "best_params"],
                 name="production_options",
             ),
@@ -111,52 +129,81 @@ def _production_pipeline() -> Pipeline:
                 outputs="submission",
                 name="predict_submission",
             ),
-            node(
-                register_model,
-                inputs=[
-                    "model",
-                    "evaluation",
-                    "column_filter",
-                    "feature_encoders",
-                    "params:data_ingestion",
-                    "params:feature_engineering",
-                    "params:target",
-                    "params:serving",
-                    "params:data_validation",
-                ],
-                outputs="serving_registration",
-                name="register_model",
-            ),
         ]
     )
 
 
-def create_pipeline(model_type: str = "lightgbm", **kwargs) -> Pipeline:
+def candidate_pipeline(name: str, candidate: dict) -> Pipeline:
+    """One candidate under the ``production_<name>`` namespace; registers nothing."""
+    model_type = candidate["model"]
     return pipeline(
-        _production_pipeline(),
-        namespace="production",
+        _candidate_pipeline(),
+        namespace=f"production_{name}",
         inputs={
             "mdl_in_train": "mdl_in_train",
             "mdl_in_valid": "mdl_in_valid",
             "mdl_in_test": "mdl_in_test",
-            "column_filter": "column_filter",
-            "feature_encoders": "feature_encoders",
             "research_importance": f"{model_type}.feature_importance",
             "research_params": f"{model_type}.best_params",
         },
-        outputs={"serving_registration": "serving_registration"},
         parameters={
             "params:model_options": f"params:{model_type}.model_options",
-            "params:production": "params:production",
-            "params:production.n_features": "params:production.n_features",
-            "params:production.holdout_fraction": "params:production.holdout_fraction",
-            "params:evaluation": "params:evaluation",
-            "params:serving": "params:serving",
-            "params:data_validation": "params:data_validation",
-            "params:data_ingestion": "params:data_ingestion",
-            "params:feature_engineering": "params:feature_engineering",
-            "params:feature_engineering.join_key": "params:feature_engineering.join_key",
-            "params:target": "params:target",
+            "params:candidate": f"params:production.candidates.{name}",
+            **{p: p for p in _SHARED_PARAMS},
         },
-        tags=["production", model_type],
+        tags=["production", model_type, f"production_{name}"],
+    )
+
+
+def choose_pipeline(candidates: dict) -> Pipeline:
+    """Choose among the candidates' saved outputs, register the winner, copy its submission."""
+    names = list(candidates)
+    return Pipeline(
+        [
+            node(
+                choose_candidate,
+                inputs={
+                    "candidates": "params:production.candidates",
+                    "selection": "params:production.selection",
+                    **{n: f"production_{n}.evaluation" for n in names},
+                },
+                outputs=["production.choice", "production.candidates_report"],
+                name="production.choose_candidate",
+            ),
+            node(
+                register_chosen,
+                inputs={
+                    "choice": "production.choice",
+                    "column_filter": "column_filter",
+                    "feature_encoders": "feature_encoders",
+                    "ingestion_params": "params:data_ingestion",
+                    "feature_params": "params:feature_engineering",
+                    "target": "params:target",
+                    "serving_params": "params:serving",
+                    "validation_params": "params:data_validation",
+                    **{f"{n}__model": f"production_{n}.model" for n in names},
+                    **{f"{n}__evaluation": f"production_{n}.evaluation" for n in names},
+                },
+                outputs="serving_registration",
+                name="production.register_model",
+            ),
+            node(
+                copy_submission,
+                inputs={
+                    "choice": "production.choice",
+                    **{n: f"production_{n}.submission" for n in names},
+                },
+                outputs="production.submission",
+                name="production.copy_submission",
+            ),
+        ],
+        tags=["production", "production_choose"],
+    )
+
+
+def create_pipeline(candidates: dict, **kwargs) -> Pipeline:
+    """Every candidate, then the choice."""
+    return sum(
+        (candidate_pipeline(name, c) for name, c in candidates.items()),
+        choose_pipeline(candidates),
     )

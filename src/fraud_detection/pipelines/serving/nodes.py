@@ -35,6 +35,7 @@ def register_model(
     target: str,
     params: dict,
     validation_params: dict | None = None,
+    extra_metadata: dict | None = None,
 ) -> dict:
     """Log the full inference chain as one MLflow pyfunc model, register it, and move the
     alias to it if it beats the current champion on valid.
@@ -66,6 +67,7 @@ def register_model(
         "registered_model_name": name,
         "version": None,
         "promoted": False,
+        **(extra_metadata or {}),
     }
     # Only inside a kedro run (kedro-mlflow has a run open); tests register nothing.
     if mlflow.active_run() is None:
@@ -92,6 +94,7 @@ def register_model(
     }
     if cost is not None:
         metadata["cost_per_1k"] = cost
+    metadata.update(extra_metadata or {})
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "bundle.pkl"
         path.write_bytes(pickle.dumps(bundle))

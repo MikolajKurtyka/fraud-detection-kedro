@@ -1,9 +1,10 @@
 name: Retrain
 
-# Weekly retraining of the served model (LightGBM, CPU) against a remote MLflow server.
-# Research LightGBM first (tuned params + feature ranking), then the production model on its
-# top-N features. @champion moves to the new version only if it beats the current champion on
-# the production holdout (serving.promotion_metric), so a worse model never reaches the API.
+# Weekly retraining of the served model (CPU) against a remote MLflow server.
+# Research LightGBM, XGBoost and CatBoost first (tuned params + feature ranking, needed by the
+# production candidates), then every production candidate and the choice among them.
+# @champion moves to the chosen version only if it beats the current champion on the
+# production holdout (serving.promotion_metric), so a worse model never reaches the API.
 #
 # Needs repository secrets:
 #   KAGGLE_API_TOKEN      Kaggle API token (scripts/download_data.py)
@@ -18,8 +19,8 @@ on:
   workflow_dispatch:
     inputs:
       n_trials:
-        description: Optuna trials for LightGBM (0 = base params)
-        default: "25"
+        description: Optuna trials per boosting model (0 = base params)
+        default: "5"
 
 concurrency:
   group: retrain
@@ -36,7 +37,9 @@ jobs:
       MLFLOW_TRACKING_PASSWORD: ${{ secrets.MLFLOW_TRACKING_PASSWORD }}
       MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
       KEDRO_DISABLE_TELEMETRY: "1"
-      N_TRIALS: ${{ inputs.n_trials || '25' }}
+      N_TRIALS: ${{ inputs.n_trials || '5' }}
+      # The runner has no GPU: XGBoost and CatBoost default to cuda / GPU in parameters_training.yml
+      CPU_PARAMS: xgboost.model_options.device=cpu,catboost.model_options.device=CPU
     steps:
       - name: Check secrets
         id: secrets
@@ -66,14 +69,17 @@ jobs:
         if: steps.secrets.outputs.ready == 'true'
         run: uv run kedro run --pipelines data_ingestion,data_validation,data_cleaning,feature_engineering
 
-      - name: Train LightGBM
+      - name: Train the research boosting models
         if: steps.secrets.outputs.ready == 'true'
-        run: uv run kedro run --pipelines training_lightgbm --params "lightgbm.model_options.n_trials=$N_TRIALS"
+        run: >-
+          uv run kedro run --pipelines training --namespaces lightgbm,xgboost,catboost
+          --params "$CPU_PARAMS,lightgbm.model_options.n_trials=$N_TRIALS,xgboost.model_options.n_trials=$N_TRIALS,catboost.model_options.n_trials=$N_TRIALS"
 
-      - name: Production model (top-N features, holdout), register, promote if better
+      - name: Production candidates, choose one, register, promote if better
         if: steps.secrets.outputs.ready == 'true'
         run: |
-          uv run kedro run --pipelines production
+          uv run kedro run --pipelines production --params "$CPU_PARAMS"
+          cat data/08_reporting/production_candidates.md >> "$GITHUB_STEP_SUMMARY"
           { echo '```json'; cat data/08_reporting/serving_registration.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload reports

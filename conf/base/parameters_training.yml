@@ -33,7 +33,7 @@ lightgbm:
     early_stopping_rounds: 200
     log_every: 500
     tuning_metric: pr_auc
-    n_trials: 25
+    n_trials: 5
     timeout_minutes: 60
     imbalance:
       method: none
@@ -74,7 +74,7 @@ xgboost:
     early_stopping_rounds: 200
     log_every: 500
     tuning_metric: pr_auc
-    n_trials: 25
+    n_trials: 5
     timeout_minutes: 60
     imbalance:
       method: none
@@ -112,7 +112,7 @@ catboost:
     early_stopping_rounds: 200
     log_every: 500
     tuning_metric: pr_auc
-    n_trials: 25
+    n_trials: 5
     timeout_minutes: 60
     imbalance:
       method: none

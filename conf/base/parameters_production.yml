@@ -1,19 +1,37 @@
-# The production model: one model type (chosen at pipeline level: `production` = LightGBM,
-# `production_<model>` the others), its research tuned params and its top-N research features.
-# It makes both the Kaggle submission (submission_production.csv) and the API model.
-# Pick n_features / param_overrides from the feature-size study (make feature-study):
-# fewer features and smaller trees are better as long as holdout PR-AUC holds.
+# The production model: a few candidates (model type + top-N research features, with that
+# model's research tuned params), each reported on a holdout; one is chosen by `selection`
+# and becomes both the Kaggle submission (submission_production.csv) and the API model.
+# Pick candidates from the feature-size study (data/08_reporting/feature_size_study_*.md).
+# Each candidate needs the research outputs of its model type ({model}_best_params.json,
+# {model}_feature_importance.csv), so train that model first.
 production:
-  # Top-N features by the research model's feature_importance; null = all of them
-  n_features: 100
+  # name -> {model, n_features (null = all), optional param_overrides}. The name is used in
+  # file names (production_<name>.pkl, submission_production_<name>.csv) and pipeline names
+  # (kedro run --pipelines production_<name>): lowercase letters, digits and underscores.
+  # Adding or removing a candidate needs this file, not --params (it changes the pipeline).
+  candidates:
+    lightgbm_100: {model: lightgbm, n_features: 100}
+    lightgbm_50: {model: lightgbm, n_features: 50}
+    xgboost_200: {model: xgboost, n_features: 200}
+    catboost_100: {model: catboost, n_features: 100}
+
+  # How choose_candidate picks the API + Kaggle model from the holdout reports:
+  # 1. one-row p99 latency (model only) <= max_latency_p99_ms (null = no budget);
+  # 2. the best holdout PR-AUC among those;
+  # 3. of the candidates within pr_auc_tolerance of it, the fewest features.
+  selection:
+    max_latency_p99_ms: 20
+    pr_auc_tolerance: 0.005
 
   # The later part of valid (by TransactionID, i.e. time) kept as a holdout: nothing is fitted,
-  # early-stopped or picked on it, so its metrics are honest and decide the @champion promotion.
-  # The research params and feature ranking did see these rows (they come from the 80/20 split),
-  # so the holdout is mostly clean, not perfectly clean.
+  # early-stopped or picked on it, so its metrics are honest and decide the choice and the
+  # @champion promotion. The research params and feature ranking did see these rows (they come
+  # from the 80/20 split), and choosing among candidates on it adds a little optimism, so the
+  # holdout is mostly clean, not perfectly clean.
   holdout_fraction: 0.5
 
-  # On top of {model}.best_params, e.g. {num_leaves: 31, max_depth: 6} for a smaller model
+  # On top of {model}.best_params for every candidate, e.g. {num_leaves: 31, max_depth: 6};
+  # a candidate's own param_overrides go on top of these
   param_overrides: {}
 
   # Holdout rows timed one by one for the single-row latency (model only, p50 / p99)

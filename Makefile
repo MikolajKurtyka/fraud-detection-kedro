@@ -4,9 +4,9 @@ BATCHES ?= 1 10 100 1000
 DURATION ?= 60
 CLIENTS ?= 1
 WORKERS ?= 4
-MODEL ?= lightgbm
+CANDIDATE ?= lightgbm_100
 
-.PHONY: help setup data ingest validate features train train-fast baselines evaluate production compare feature-study serving-latency run viz mlflow api api-prod loadtest test lint format docker-up docker-down clean
+.PHONY: help setup data ingest validate features train train-fast baselines evaluate production candidate choose compare feature-study serving-latency run viz mlflow api api-prod loadtest test lint format docker-up docker-down clean
 
 help:  ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -38,8 +38,14 @@ baselines:  ## Train + evaluate only the baselines (logreg, random_forest, hist_
 evaluate:  ## Metrics, curves and Kaggle submissions for the saved models
 	uv run kedro run --pipelines evaluation
 
-production:  ## Production model (MODEL, top-N features, holdout) -> submission_production.csv + MLflow @champion
-	uv run kedro run --pipelines production_$(MODEL)
+production:  ## Every production candidate, then choose one -> submission_production.csv + MLflow @champion
+	uv run kedro run --pipelines production
+
+candidate:  ## One production candidate (CANDIDATE=xgboost_200) -> its own submission, registers nothing
+	uv run kedro run --pipelines production_$(CANDIDATE)
+
+choose:  ## Choose again from the saved candidate results (after `make candidate`)
+	uv run kedro run --pipelines production_choose
 
 compare:  ## History of all trained models from MLflow as a table
 	uv run python scripts/compare_runs.py
