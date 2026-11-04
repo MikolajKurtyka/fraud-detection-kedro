@@ -1,3 +1,1 @@
-from .pipeline import create_pipeline
-
-__all__ = ["create_pipeline"]
+"""Serving nodes: package a trained model for the API and register it (used by production)."""

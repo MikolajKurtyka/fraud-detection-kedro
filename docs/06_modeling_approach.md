@@ -127,11 +127,43 @@ several hours on one laptop. CatBoost and HistGB are the slowest; use `--models`
 - **The feature count barely changes serving latency.** The code path and the thread setting
   matter much more (see [7. Serving API](07_serving_api.md#latency-per-model-type)). LightGBM
   scores a raw row in under 1 ms with all 395 features.
-- The ranking comes from a model early-stopped on valid, so the top-N runs get a slight
-  optimistic edge.
+- The ranking comes from a model early-stopped on valid, and every top-N run is scored on
+  the same valid, so the study leans slightly optimistic. This is accepted on purpose: the
+  research track keeps all labelled days for training, which is what the Kaggle score needs.
+  The honest number for the configuration you pick comes from the production holdout
+  (next section).
 
 Feature count is therefore an accuracy / maintenance choice: the top 100–150 features keep the full
 model's accuracy with a third of the columns to compute, monitor and explain.
+
+### From research to the production model
+
+The research track (`training`, `evaluation`, the study above) compares every model on every
+feature. The `production` pipeline turns one result into the model used for **both** the Kaggle
+submission and the API:
+
+- **Model type**: by pipeline name (`production` = LightGBM, `production_<model>` another).
+- **Features**: the top `production.n_features` (default 100) of that model's research importance.
+  Fewer is better if accuracy holds: fewer columns to compute, monitor and explain.
+- **Params**: the research `best_params`, plus `production.param_overrides` for a smaller model
+  (e.g. the compact settings above).
+- **Holdout**: valid is cut by time into two halves. The earlier half is used for early stopping
+  and picking the threshold; the later half is the holdout, where the model is scored at that
+  threshold. `holdout_pr_auc` decides the `@champion` promotion, and `production_evaluation.json`
+  also records `n_features` and one-row latency, so accuracy and speed sit side by side.
+- **Kaggle**: the same config refitted on all labelled data (`submission_production.csv`).
+  The API serves the train-only model, because its threshold was picked for it.
+
+```mermaid
+flowchart LR
+    subgraph research["Research: 80 / 20"]
+        A1["train<br/>days 1–140"] --> B1["valid days 141–182<br/>early stopping · tuning<br/>feature ranking · study"]
+    end
+    subgraph production["Production: same train, valid cut in two"]
+        A2["train<br/>top-N features"] --> B2["valid, earlier half<br/>early stopping · threshold"] --> C2["holdout, later half<br/>reported metrics · promotion"]
+    end
+    research -->|"best_params,<br/>feature ranking"| production
+```
 
 The `e2e` columns in the per-model CSVs are not comparable across models: LightGBM was timed on the
 pandas path, XGBoost on the NumPy fast path. Use `scripts/serving_latency.py` for a like-for-like
@@ -160,7 +192,7 @@ Fix drifting features where possible, and drop them only when you can't:
 | Gradient-boosted trees (LightGBM, XGBoost, CatBoost) | Best for wide tabular data with NaNs and mixed types; native categorical support |
 | Three libraries side by side | Same input and metrics, so MLflow shows the trade-offs directly. LightGBM currently leads (baseline valid PR-AUC 0.614) |
 | **Baselines**: logistic regression, random forest, scikit-learn HistGradientBoosting | Answers "how much does boosting actually add?". Same input, metrics and MLflow runs. Untuned by default |
-| Optuna TPE, 25 trials / 60 min per boosting model, tuning metric PR-AUC | Cheap, reproducible (seed 42) |
+| Optuna TPE, 5 trials / 60 min per boosting model, tuning metric PR-AUC | Cheap, reproducible (seed 42) |
 | Early stopping (200 rounds) on valid, up to 5000 trees | Finds the number of trees automatically |
 | **Refit on train + valid** for the submission, with `best_iteration × 1.2` trees | The valid days are the closest to test; a train-only model never learns from them. 1.2 because there is ~25% more data |
 | Rank-average **blend** of the boosting models | Different libraries make partly different mistakes. Baselines stay out of it so they don't pull it down |
@@ -227,7 +259,7 @@ All values live in `conf/base/parameters_training.yml`, one block per model. Eac
 | `early_stopping_rounds` | 200 | Stop when valid AUC has not improved for 200 trees; keep the best tree count (`best_iteration`) |
 | `log_every` | 500 | Print valid AUC every 500 trees (in `logs/info.log`) |
 | `tuning_metric` | `pr_auc` | What Optuna maximises on valid. PR-AUC focuses on the 3.5% fraud class; ROC-AUC is also logged |
-| `n_trials` | 25 | Optuna trials per model. `0` skips tuning and trains once with `params` |
+| `n_trials` | 5 | Optuna trials per model. `0` skips tuning and trains once with `params` |
 | `timeout_minutes` | 60 | Stops tuning early if the trials take longer than this |
 | `imbalance.method` | `none` | `none`, `class_weight` or `undersample` (see [class imbalance](#1-class-imbalance-35-fraud)) |
 | `imbalance.undersample_ratio` | 5 | Legit rows kept per fraud row when undersampling |
@@ -333,21 +365,15 @@ from tuning.
 
 ## Known limitations
 
-1. **Optimistic validation score.** The valid split does five jobs: early stopping, Optuna
-   tuning, choosing the threshold, champion promotion, and the reported metrics. Each choice made
-   on it makes its score a little more optimistic, and CV reuses the parameters tuned on it.
-   Fix: a third, later holdout (e.g. the last 2–3 weeks) used only for the final report and the
-   promotion decision.
-
-   ```mermaid
-   flowchart LR
-       subgraph now["Today"]
-           A1["train<br/>days 1–140"] --> B1["valid days 141–182<br/>early stopping · tuning · threshold<br/>promotion · reported metrics"]
-       end
-       subgraph better["Proposed"]
-           A2["train"] --> B2["valid<br/>early stopping · tuning · threshold"] --> C2["holdout (last 2–3 weeks)<br/>reported metrics · promotion"]
-       end
-   ```
+1. **Optimistic research scores, mostly clean production holdout.** In the research track the
+   valid split does several jobs (early stopping, Optuna tuning, choosing the threshold, the
+   reported metrics), so every research number is a little optimistic. This is accepted: research
+   keeps all labelled days for training. The production pipeline reports and promotes on a
+   holdout (the later half of valid) that it never fits, early-stops or picks a threshold on
+   ([above](#from-research-to-the-production-model)). It is mostly clean, not perfectly clean:
+   the research `best_params` and feature ranking it reuses were chosen on the full valid,
+   holdout days included. A fully clean holdout would need the research split to leave those
+   days out too.
 2. **Train–valid gap of ~0.07 ROC-AUC** for all models (LightGBM train ROC-AUC 0.999). This
    suggests overfitting (256 leaves, depth 13) and/or remaining drift. Try stronger
    regularisation, plus funnel steps c–e.

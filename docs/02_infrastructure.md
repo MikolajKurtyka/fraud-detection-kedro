@@ -322,11 +322,11 @@ The API picks up a new champion on its next restart.
 | `make ingest` | `kedro run --pipelines data_ingestion` | 01 → 02 |
 | `make validate` | `kedro run --pipelines data_validation` | pandera checks on 02 → `08_reporting/data_validation.json` |
 | `make features` | `… data_cleaning,feature_engineering` | 02 → 05 |
-| `make train` | `… training,evaluation,serving` | Tune and train all models, evaluate, write submissions, register LightGBM |
-| `make train-fast` | `… training,evaluation --params "*.n_trials=0"` | Train and evaluate once with the base params, no tuning (does not register) |
+| `make train` | `… training,evaluation` | Research: tune and train all models on all features, evaluate, write their submissions |
+| `make train-fast` | `… training,evaluation --params "*.n_trials=0"` | Train and evaluate once with the base params, no tuning |
 | `make baselines` | `… --namespaces logreg,random_forest,hist_gb` | Train and evaluate only the three baselines |
 | `make evaluate` | `kedro run --pipelines evaluation` | Metrics, cost threshold, curves, SHAP and submissions for the saved models |
-| `make register` | `kedro run --pipelines serving` | Register the saved LightGBM in MLflow; `@champion` moves if it beats the current one |
+| `make production` | `kedro run --pipelines production_$(MODEL)` | The Kaggle + API model (`MODEL=lightgbm` by default): top-N features, holdout report, `submission_production.csv`, register; `@champion` moves if holdout PR-AUC beats the current one |
 | `make compare` | `scripts/compare_runs.py` | Run history table from MLflow |
 | `make feature-study` | `scripts/feature_size_study.py` | Accuracy, model size and latency vs number of features |
 | `make serving-latency` | `scripts/serving_latency.py` | Single-row latency of every saved model: pandas vs NumPy path, default threads vs one thread |

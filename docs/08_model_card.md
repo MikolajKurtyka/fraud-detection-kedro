@@ -7,8 +7,8 @@
 - **Task**: binary classification, the probability that a card-not-present transaction is fraudulent
 - **Algorithms**: LightGBM, XGBoost and CatBoost, plus logistic regression, random forest and scikit-learn HistGradientBoosting as baselines, all trained on the same features and compared. Hyperparameter tuning with Optuna (PR-AUC) is built in but hasn't been run yet. LightGBM is currently the best
 - **Input**: raw transaction + identity columns, turned into 395 features by `InferenceBundle` (see [5. Pipelines](05_pipelines.md#feature_engineering))
-- **Variants**: `{model}.pkl` (train only, the one with validated metrics) and `{model}_final.pkl` (refitted on train + valid, used for the Kaggle submissions)
-- **Version**: tracked in the MLflow registry as `fraud-detection`; the served version carries the `champion` alias and every API response names it (`model_version`). The registered artifact is the full inference bundle (column filter + feature encoders + LightGBM), with its threshold, cost per 1k, valid PR-AUC and training run ID as tags (see [7. Serving API](07_serving_api.md#how-a-model-reaches-the-api))
+- **Variants**: research `{model}.pkl` (train only, the one with validated metrics) and `{model}_final.pkl` (refitted on train + valid). The **production** model (`production.pkl`, `production_final.pkl`) is one model type with its research params on its top-N features (`conf/base/parameters_production.yml`); the train-only one is served, the refit one writes `submission_production.csv`
+- **Version**: tracked in the MLflow registry as `fraud-detection`; the served version carries the `champion` alias and every API response names it (`model_version`). The registered artifact is the full inference bundle (column filter + feature encoders + LightGBM), with its threshold, cost per 1k, holdout PR-AUC and training run ID as tags (see [7. Serving API](07_serving_api.md#how-a-model-reaches-the-api))
 - **Owner**: Mikolaj Kurtyka
 
 ## Intended Use
@@ -25,7 +25,7 @@
 
 ## Evaluation
 
-- **Split**: time-based (train on earlier days, validate on later days). A random split would leak future fraud patterns
+- **Split**: time-based (train on earlier days, validate on later days). A random split would leak future fraud patterns. The production model also keeps the later half of valid as a holdout for its reported metrics and the promotion
 - **Metrics**: PR-AUC (main), ROC-AUC, train–valid gap; precision / recall / F1 / FPR and expected cost per 1k transactions at 0.5, at the best-F1 threshold, at 1% FPR and at the cost-optimal threshold; PR, ROC and cost curves
 - **Threshold**: the one with the lowest expected cost on valid: missed fraud costs its `TransactionAmt`, every flagged transaction $5 (review), every flagged good customer $15 more. For LightGBM: 0.077, $2,764 per 1k transactions vs $5,156 with no model. The costs are assumptions to agree with the business. The threshold is stored with the registered model; `FRAUD_THRESHOLD` overrides it
 
@@ -45,7 +45,8 @@ fraud. At its best-F1 threshold, 73% of flagged transactions are fraud and 50% o
 
 These scores are slightly optimistic: early stopping picked the number of trees on the same
 validation split, and the best-F1 and min-cost thresholds were chosen on it too (see
-[6. Modeling approach](06_modeling_approach.md#known-limitations)). Kaggle submissions
+[6. Modeling approach](06_modeling_approach.md#known-limitations)). The production model's
+`holdout_*` metrics (`data/08_reporting/production_evaluation.json`) are the honest numbers. Kaggle submissions
 (`data/07_model_output/`) have been written but not uploaded, so there's no test-set score yet.
 
 ## Explainability

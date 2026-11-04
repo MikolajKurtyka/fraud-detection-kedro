@@ -15,9 +15,9 @@ excludes everything except the `.gitkeep` files that keep the folder structure.
 | `03_primary` | Clean data: one trusted table per split | `train.parquet` (days 1–140 of int_train), `valid.parquet` (days 141–182), `test.parquet`, all with the same columns dropped; `column_filter.json`: which columns were dropped and why, fitted on train only | `data_cleaning` |
 | `04_feature` | Engineered features, such as aggregates and encodings | `train/valid/test.parquet` with all engineered columns; `feature_encoders.pkl`: group stats, frequencies, category encodings and the final feature list, fitted on train only | `feature_engineering` |
 | `05_model_input` | The final matrices given to the model | `train/valid/test.parquet`: `TransactionID`, `isFraud` (not in test) and the 395 model features in a fixed order | `feature_engineering` |
-| `06_models` | Trained models, one set per model (`lightgbm`, `xgboost`, `catboost`, `logreg`, `random_forest`, `hist_gb`) | `{model}.pkl` (`FraudModel`, trained on train only), `{model}_final.pkl` (refitted on train + valid, for the submission) and `{model}_best_params.json` | `training` |
-| `07_model_output` | Predictions | `submission_{model}.csv` (`TransactionID`, `isFraud` probability for all 506,691 test rows) and `submission_blend.csv` (rank average of the boosting models) | `evaluation` |
-| `08_reporting` | Metrics and reports | From `data_validation`: `data_validation.json` (row counts, fraud rate, largest train/test null-rate difference, failed checks). From `training`: `{model}_metrics.json` (train/valid ROC-AUC and PR-AUC, gap, best iteration, number of features, fit time), `{model}_feature_importance.csv`, `{model}_cv_metrics.json`. From `evaluation`: `{model}_evaluation.json` (precision / recall / F1 / FPR / confusion counts and cost per 1k at four thresholds), `{model}_curves.png` (PR + ROC + cost), `{model}_shap_importance.csv` and `{model}_shap.png` (boosting models). From `serving`: `serving_registration.json` (version, threshold, promoted or not). From scripts: `model_comparison.{csv,md}`, `feature_size_study_{model}.{csv,md,png}`, `feature_size_study_all.png`, `serving_latency.csv`, `loadtest.{csv,md}` | `data_validation`, `training`, `evaluation`, `serving`, `scripts/` |
+| `06_models` | Trained models, one set per model (`lightgbm`, `xgboost`, `catboost`, `logreg`, `random_forest`, `hist_gb`, and `production`) | `{model}.pkl` (`FraudModel`, trained on train only), `{model}_final.pkl` (refitted on train + valid, for the submission) and `{model}_best_params.json`; `production_features.json` (the production feature list). These are the latest copies: every run also stores its pickles in its MLflow run (`model/model.pkl`, `model/final_model.pkl`) | `training`, `production` |
+| `07_model_output` | Predictions | `submission_production.csv` (the file to upload), `submission_{model}.csv` (`TransactionID`, `isFraud` probability for all 506,691 test rows) and `submission_blend.csv` (rank average of the boosting models) | `production`, `evaluation` |
+| `08_reporting` | Metrics and reports | From `data_validation`: `data_validation.json` (row counts, fraud rate, largest train/test null-rate difference, failed checks). From `training`: `{model}_metrics.json` (train/valid ROC-AUC and PR-AUC, gap, best iteration, number of features, fit time), `{model}_feature_importance.csv`, `{model}_cv_metrics.json`. From `evaluation`: `{model}_evaluation.json` (precision / recall / F1 / FPR / confusion counts and cost per 1k at four thresholds), `{model}_curves.png` (PR + ROC + cost), `{model}_shap_importance.csv` and `{model}_shap.png` (boosting models). From `production`: `production_evaluation.json` (valid metrics, `holdout_*` metrics at the valid threshold, `n_features`, one-row latency), `production_metrics.json`, `production_curves.png`, `serving_registration.json` (version, threshold, promoted or not). From scripts: `model_comparison.{csv,md}`, `feature_size_study_{model}.{csv,md,png}`, `feature_size_study_all.png`, `serving_latency.csv`, `loadtest.{csv,md}` | `data_validation`, `training`, `evaluation`, `production`, `scripts/` |
 
 `01_raw/_manifest.json` records the source competition, the download time and the size and
 SHA256 checksum of each file, so any model can be traced back to the exact data it was trained on.
@@ -92,14 +92,14 @@ reused unchanged on every other piece of data (valid, test, an API request):
 Together they make up the **inference chain** described in
 [5. Pipelines](05_pipelines.md#the-fit--apply-pattern). `InferenceBundle`
 (`src/fraud_detection/inference.py`) packs the first two artifacts plus a model and the
-ingestion/feature parameters into one object for serving. The `serving` pipeline registers that
+ingestion/feature parameters into one object for serving. The `production` pipeline registers that
 bundle in MLflow, so the registry, not `data/`, is what the API reads.
 
 ```mermaid
 flowchart LR
-    TR[train split] --> CF[/column_filter.json/] & FE[/feature_encoders.pkl/] & M[/"{model}.pkl"/]
+    TR[train split] --> CF[/column_filter.json/] & FE[/feature_encoders.pkl/] & M[/"production.pkl"/]
     CF & FE & M --> B["InferenceBundle<br/>+ ingestion / feature params"]
-    B -->|"serving pipeline"| REG[("MLflow registry<br/>fraud-detection vN")]
+    B -->|"production pipeline"| REG[("MLflow registry<br/>fraud-detection vN")]
     REG -->|"@champion"| API[FastAPI]
 ```
 

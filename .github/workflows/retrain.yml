@@ -1,8 +1,9 @@
 name: Retrain
 
 # Weekly retraining of the served model (LightGBM, CPU) against a remote MLflow server.
-# @champion moves to the new version only if it beats the current champion on valid
-# (serving.promotion_metric), so a worse model never reaches the API.
+# Research LightGBM first (tuned params + feature ranking), then the production model on its
+# top-N features. @champion moves to the new version only if it beats the current champion on
+# the production holdout (serving.promotion_metric), so a worse model never reaches the API.
 #
 # Needs repository secrets:
 #   KAGGLE_API_TOKEN      Kaggle API token (scripts/download_data.py)
@@ -69,14 +70,10 @@ jobs:
         if: steps.secrets.outputs.ready == 'true'
         run: uv run kedro run --pipelines training_lightgbm --params "lightgbm.model_options.n_trials=$N_TRIALS"
 
-      - name: Evaluate (metrics, cost threshold, SHAP)
-        if: steps.secrets.outputs.ready == 'true'
-        run: uv run kedro run --pipelines evaluation --namespaces lightgbm
-
-      - name: Register, promote if better
+      - name: Production model (top-N features, holdout), register, promote if better
         if: steps.secrets.outputs.ready == 'true'
         run: |
-          uv run kedro run --pipelines serving
+          uv run kedro run --pipelines production
           { echo '```json'; cat data/08_reporting/serving_registration.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload reports

@@ -169,7 +169,21 @@ feature_encoders:
     kedro-viz:
       layer: reporting
 
-# ---------- serving: what the serving pipeline registered in MLflow (version, threshold, promoted) ----------
+# ---------- production: the one model for Kaggle and the API ----------
+# Other production outputs reuse the {model}.* entries above with model = "production":
+# production.pkl, production_final.pkl, production_best_params.json, production_evaluation.json
+# (valid + holdout_* metrics), submission_production.csv, ...
+# The top-N feature names the production model was trained on
+production.features:
+  type: json.JSONDataset
+  filepath: data/06_models/production_features.json
+  save_args:
+    indent: 2
+  metadata:
+    kedro-viz:
+      layer: models
+
+# What the production pipeline registered in MLflow (version, threshold, promoted)
 serving_registration:
   type: json.JSONDataset
   filepath: data/08_reporting/serving_registration.json

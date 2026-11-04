@@ -3,12 +3,16 @@
 kedro-mlflow opens one MLflow run per ``kedro run``. Each model logs into its own
 nested child run (same metric names for every model, so they compare side by side
 in the MLflow UI); Optuna trials are nested one level deeper. CV and refit numbers
-are added to the model's final run.
+are added to the model's final run, and so are both pickles (``model/model.pkl`` and
+``model/final_model.pkl``), so every run keeps the exact models its metrics came from.
 """
 
 import logging
+import pickle
+import tempfile
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import mlflow
 import numpy as np
@@ -52,6 +56,19 @@ def _log_to_training_run(model: FraudModel, metrics: dict) -> None:
     client = MlflowClient()
     for key, value in metrics.items():
         client.log_metric(model.mlflow_run_id, key, value)
+
+
+def _log_model_artifact(model: FraudModel, name: str) -> None:
+    """Pickle the model into its training run under ``model/``; a no-op outside a kedro run.
+
+    The pickles in data/06_models are overwritten by every run; these copies are not.
+    """
+    if mlflow.active_run() is None or model.mlflow_run_id is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / f"{name}.pkl"
+        path.write_bytes(pickle.dumps(model))
+        MlflowClient().log_artifact(model.mlflow_run_id, str(path), "model")
 
 
 def _permutation_importance(model: FraudModel, X: pd.DataFrame, y: pd.Series) -> pd.DataFrame:
@@ -168,12 +185,15 @@ def train_model(
     """Fit the final model with early stopping on valid; report train and valid metrics.
 
     A large train-valid gap means overfitting or features that drift over time.
+    ``options["run_name"]`` / ``options["stage"]`` name the MLflow run (default: the model
+    type, stage "final"); the production pipeline sets its own.
     """
     model_type = options["model_type"]
     X, y = _split_xy(train, target, join_key)
     X_valid, y_valid = _split_xy(valid, target, join_key)
+    run_name, stage = options.get("run_name", model_type), options.get("stage", "final")
 
-    with _child_run(model_type, model_type=model_type, stage="final") as run:
+    with _child_run(run_name, model_type=model_type, stage=stage) as run:
         start = time.time()
         model = FraudModel(model_type, params, options).fit(X, y, X_valid, y_valid)
         fit_seconds = time.time() - start
@@ -203,6 +223,7 @@ def train_model(
             )
             mlflow.log_metrics({k: v for k, v in metrics.items() if v is not None})
             mlflow.log_text(importance.to_csv(index=False), "feature_importance.csv")
+            _log_model_artifact(model, "model")
 
     logger.info(
         "%s: valid ROC-AUC %.5f, PR-AUC %.5f | train ROC-AUC %.5f (gap %.4f) | "
@@ -320,6 +341,7 @@ def refit_model(
     if n_iterations is not None:
         refit_metrics["refit_iterations"] = n_iterations
     _log_to_training_run(model, refit_metrics)
+    _log_model_artifact(refitted, "final_model")
     logger.info(
         "%s: refitted on train + valid (%d rows, %s trees), %.0fs",
         model_type,

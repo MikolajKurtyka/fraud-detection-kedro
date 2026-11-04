@@ -90,7 +90,8 @@ The key ideas:
 | `evaluation`: cost-based threshold (stored with the model, used by the API), global SHAP importance | Done |
 | Per-prediction SHAP explanations (`POST /explain`) | Done |
 | Weekly retraining workflow against a remote MLflow | Done; needs a hosted MLflow server and secrets |
-| `serving`: register the inference bundle in the MLflow registry, move `@champion` only if valid PR-AUC improves (`make register`) | Done |
+| `production`: one chosen model on its top-N features, honest holdout, the Kaggle submission and the API model; `@champion` moves only if holdout PR-AUC improves (`make production`) | Done |
+| Every trained model (train-only and refit) stored in its MLflow run | Done |
 
 **Latest results**: all models use their base `params` (no Optuna tuning yet). Validation is
 on days 141–182, with 395 features:

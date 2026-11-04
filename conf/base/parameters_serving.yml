@@ -9,5 +9,7 @@ serving:
   # best_f1_threshold maximises F1, fixed_threshold is evaluation.fixed_threshold.
   threshold_metric: min_cost_threshold
 
-  # The alias moves to a new version only if it beats the current champion on this valid metric.
-  promotion_metric: pr_auc
+  # The alias moves to a new version only if it beats the current champion on this metric.
+  # holdout_pr_auc comes from the production pipeline's holdout (see parameters_production.yml);
+  # a champion without this tag (registered before) counts as no champion.
+  promotion_metric: holdout_pr_auc

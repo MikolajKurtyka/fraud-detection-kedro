@@ -1,0 +1,20 @@
+# The production model: one model type (chosen at pipeline level: `production` = LightGBM,
+# `production_<model>` the others), its research tuned params and its top-N research features.
+# It makes both the Kaggle submission (submission_production.csv) and the API model.
+# Pick n_features / param_overrides from the feature-size study (make feature-study):
+# fewer features and smaller trees are better as long as holdout PR-AUC holds.
+production:
+  # Top-N features by the research model's feature_importance; null = all of them
+  n_features: 100
+
+  # The later part of valid (by TransactionID, i.e. time) kept as a holdout: nothing is fitted,
+  # early-stopped or picked on it, so its metrics are honest and decide the @champion promotion.
+  # The research params and feature ranking did see these rows (they come from the 80/20 split),
+  # so the holdout is mostly clean, not perfectly clean.
+  holdout_fraction: 0.5
+
+  # On top of {model}.best_params, e.g. {num_leaves: 31, max_depth: 6} for a smaller model
+  param_overrides: {}
+
+  # Holdout rows timed one by one for the single-row latency (model only, p50 / p99)
+  latency_rows: 500

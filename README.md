@@ -33,7 +33,8 @@ and a containerised FastAPI scoring service.
 | NumPy fast path for serving (`fast_inference.py`, ~2 ms per row, bit-identical to the pandas path) | Done |
 | Open-loop async load test, 1–10000 requests/min × 1–1000 rows (`make loadtest`) | Done |
 | Feature-count study (accuracy / size / latency vs top-N features, all 6 models) and per-model serving latency (`make feature-study`, `make serving-latency`) | Done |
-| `serving`: register the bundle in the MLflow registry, move `@champion` only if PR-AUC improves (`make register`) | Done |
+| `production`: one chosen model on its top-N features, honest holdout, the Kaggle submission and the API model; `@champion` moves only if holdout PR-AUC improves (`make production`) | Done |
+| Every trained model (train-only and refit) stored in its MLflow run, not only on disk | Done |
 | `data_validation` (pandera schemas, train/test parity) | Done |
 | Per-prediction SHAP explanations (`POST /explain`) | Done |
 | Scheduled retraining (`.github/workflows/retrain.yml`) | Done; needs a hosted MLflow server and two secrets |
@@ -63,9 +64,10 @@ flowchart LR
         FE["feature_engineering<br/>D-norm, UID,<br/>aggregates, encodings"]
         TR["training<br/>3 boosting + 3 baselines<br/>Optuna, refit"]
         EV["evaluation<br/>4 thresholds incl. min cost,<br/>curves, SHAP, submissions"]
-        SV["serving<br/>InferenceBundle →<br/>MLflow pyfunc"]
+        SV["production<br/>chosen model, top-N features,<br/>holdout → submission +<br/>MLflow pyfunc"]
         RAW --> ING --> VAL
-        ING --> CLN --> FE --> TR --> EV --> SV
+        ING --> CLN --> FE --> TR --> EV
+        TR -->|"best params,<br/>feature ranking"| SV
     end
 
     subgraph compose["docker compose"]
@@ -77,13 +79,13 @@ flowchart LR
     end
 
     TR & EV -.->|"runs, metrics,<br/>artifacts"| MF
-    SV -->|"register; move @champion<br/>only if PR-AUC improves"| MF
+    SV -->|"register; move @champion<br/>only if holdout PR-AUC improves"| MF
     Client([Client]) -->|"POST /predict"| API
     API -->|"probability + decision<br/>(cost-optimal threshold)"| Client
 ```
 
 GitHub Actions: `ci.yml` runs lint → tests → Kedro load check → Docker image build on every push and
-PR; `retrain.yml` retrains, evaluates and registers LightGBM every Monday.
+PR; `retrain.yml` retrains LightGBM and registers the production model every Monday.
 
 ## Key Components
 
@@ -97,10 +99,12 @@ PR; `retrain.yml` retrains, evaluates and registers LightGBM every Monday.
 | `feature_engineering` | `03` → `04_feature` → `05_model_input` | Time features, normalized D columns, email parts, client UID proxy, group-ratio / frequency / UID aggregates and category encodings fitted on train |
 | `training` | `05` → `06_models` | LightGBM, XGBoost (GPU), CatBoost (GPU) with Optuna tuning, plus logistic regression, random forest and HistGradientBoosting baselines; early stopping on valid, optional time-series CV, refit on train + valid for the submission; one nested MLflow run per model |
 | `evaluation` | `06` → `08_reporting` | Precision / recall / F1 at 4 thresholds incl. the cost-optimal one, PR + ROC + cost curves, global SHAP importance (boosting models), Kaggle submissions per model + blend |
-| `serving` | `06` + fitted artifacts → MLflow registry | Wraps one model (LightGBM by default) with its column filter and encoders as an MLflow pyfunc, registers it as `fraud-detection`, moves `@champion` only if valid PR-AUC improves |
+| `production` | research `06` / `08` + `05` → `07` + MLflow registry | One model type (LightGBM by default) with its tuned params on its top-N features. Splits valid into valid + holdout, reports on the holdout, refits for `submission_production.csv`, wraps the model with its column filter and encoders as an MLflow pyfunc, moves `@champion` only if holdout PR-AUC improves |
 
-**MLflow** (through `kedro-mlflow`) records parameters, metrics and artifacts for every `kedro run`
-and keeps models in the registry. The model that serves traffic carries the `champion` alias.
+**MLflow** (through `kedro-mlflow`) records parameters, metrics and artifacts for every `kedro run`.
+Every trained model is stored in its own run (`model/model.pkl`, `model/final_model.pkl`), so
+retraining never loses an old model; `data/06_models/` only holds the latest copies. The registry
+holds the production models; the one that serves traffic carries the `champion` alias.
 
 **Scoring API** (`src/fraud_detection/api/`) is a FastAPI app that resolves `models:/fraud-detection@champion`
 to a concrete version at startup and exposes `/predict`, `/predict/batch`, `/explain`, `/health/live`,
@@ -243,7 +247,8 @@ All commands have a `make` shortcut (`make help`); on Windows without `make`, ru
 uv run kedro run --pipelines data_ingestion                      # make ingest
 uv run kedro run --pipelines data_validation                     # make validate
 uv run kedro run --pipelines data_cleaning,feature_engineering   # make features
-uv run kedro run --pipelines training                            # make train: 3 boosting models + Optuna, 3 baselines
+uv run kedro run --pipelines training                            # 3 boosting models + Optuna, 3 baselines
+uv run kedro run --pipelines production                          # make production: the Kaggle + API model
 uv run kedro run                                                 # make run (all pipelines)
 uv run kedro registry list                                       # list pipelines
 uv run kedro viz run                                             # make viz: interactive pipeline graph
@@ -259,8 +264,9 @@ uv run python scripts/download_data.py                           # 1. raw CSVs (
 uv run kedro run --pipelines data_ingestion                      # 2. typed + joined   (~30 s)
 uv run kedro run --pipelines data_validation                     #    pandera checks    (~5 s)
 uv run kedro run --pipelines data_cleaning,feature_engineering   # 3. split, filter, features (~2 min)
-uv run kedro run --pipelines training,evaluation                 # 4. tune + train all models, refit on train + valid, evaluate, submissions (up to ~3 h)
+uv run kedro run --pipelines training,evaluation                 # 4. research: tune + train all models, evaluate, submissions (up to ~3 h)
 uv run python scripts/compare_runs.py                            # 5. results table of all runs
+uv run kedro run --pipelines production                          # 6. production model: holdout report, submission, registry
 ```
 
 Step 4 without tuning (~8 min): add
@@ -311,7 +317,7 @@ Each group has precision, recall, F1, FPR, the confusion-matrix counts (tp / fp 
 `*_cost_per_1k`, the expected cost per 1,000 transactions (`no_model_cost_per_1k` is the cost of
 approving everything). They are saved to `data/08_reporting/<model>_evaluation.json`, the PR, ROC
 and cost curves to `data/08_reporting/<model>_curves.png`, and both are added to the model's
-MLflow run (metrics `eval_*`, artifact `evaluation_curves.png`). The serving pipeline stores the
+MLflow run (metrics `eval_*`, artifact `evaluation_curves.png`). The production pipeline stores the
 `min_cost` threshold with the registered model, so the API decides by cost.
 
 For LightGBM, XGBoost and CatBoost the evaluation also computes **SHAP** values on 5,000 valid rows
@@ -323,10 +329,13 @@ What these metrics mean in business terms, with blocks and losses per 10,000 tra
 
 ### Kaggle submission
 
-The evaluation pipeline also scores the Kaggle test set (506,691 rows) with every model:
+The file to upload is `data/07_model_output/submission_production.csv`, from the production
+model ([below](#research-vs-production)). The evaluation pipeline also scores the Kaggle test set
+(506,691 rows) with every research model, for comparison:
 
 | File | Model |
 |---|---|
+| `data/07_model_output/submission_production.csv` | **Production model** (chosen model type, top-N features) |
 | `data/07_model_output/submission_lightgbm.csv` | LightGBM |
 | `data/07_model_output/submission_xgboost.csv` | XGBoost |
 | `data/07_model_output/submission_catboost.csv` | CatBoost |
@@ -337,7 +346,7 @@ Upload (needs your Kaggle token and the competition rules accepted; Kaggle allow
 of submissions per day):
 
 ```bash
-uv run kaggle competitions submit -c ieee-fraud-detection -f data/07_model_output/submission_blend.csv -m "blend baseline"
+uv run kaggle competitions submit -c ieee-fraud-detection -f data/07_model_output/submission_production.csv -m "production"
 uv run kaggle competitions submissions -c ieee-fraud-detection   # see the scores
 ```
 
@@ -346,6 +355,40 @@ Or upload the CSV on the competition page → **Submit Prediction**.
 Submissions come from `<model>_final.pkl`: the model refitted on all labelled data (train + valid,
 `refit: true`) with `best_iteration × 1.2` trees, because the valid days are the closest to test.
 All valid metrics still come from the train-only `<model>.pkl`.
+
+### Research vs production
+
+The project has two tracks:
+
+| | Research (`training`, `evaluation`, scripts) | Production (`production`) |
+|---|---|---|
+| Purpose | Show what was tried: 6 models, all 395 features, Optuna, feature-size study | One model for both the Kaggle submission and the API |
+| Model | Every model type | One type (`production` = LightGBM, `production_<model>` another) |
+| Features | All | Top `n_features` of the research model's importance (default 100) |
+| Params | Optuna search | The research `best_params`, plus optional `param_overrides` (e.g. smaller trees) |
+| Scored on | Valid (also used for early stopping and tuning, so optimistic) | A **holdout**: the later half of valid, never fitted, early-stopped or picked on |
+| Output | `submission_<model>.csv`, reports | `submission_production.csv`, MLflow `@champion` |
+
+Production reads the research outputs of its model type live (`<model>_best_params.json`,
+`<model>_feature_importance.csv`), so run the research training for that model first. Settings are
+in `conf/base/parameters_production.yml`: choose `n_features` and `param_overrides` from the
+[feature-size study](#fewer-features-smaller-models-faster-serving). Fewer features and smaller
+trees are better as long as holdout PR-AUC holds.
+
+```bash
+uv run kedro run --pipelines production                 # make production (LightGBM)
+uv run kedro run --pipelines production_xgboost         # make production MODEL=xgboost
+uv run kedro run --pipelines production --params "production.n_features=50"
+```
+
+`data/08_reporting/production_evaluation.json` has the valid metrics (where the threshold is
+picked) and the `holdout_*` metrics at that threshold, plus `n_features` and the one-row model
+latency (`latency_p50_ms`, `latency_p99_ms`). `@champion` moves only if `holdout_pr_auc` beats the
+current champion. The API serves the train-only model, because its threshold was picked for it;
+Kaggle gets the same config refitted on all labelled data.
+
+The holdout is mostly clean, not perfectly clean: the research params and the feature ranking were
+chosen on the full valid, which includes the holdout days.
 
 ### Watching a run
 
@@ -428,7 +471,7 @@ docker compose up -d --build    # make docker-up
 | API | http://localhost:8000/docs | Swagger UI for `/predict`, `/predict/batch`, `/explain` and `/health/*` |
 
 The API container waits until the MLflow server answers its healthcheck, because it loads the
-`@champion` model once at startup. Register a model first (`make train` or `make register` with
+`@champion` model once at startup. Register a model first (`make production` with
 `MLFLOW_TRACKING_URI=http://localhost:5000`), then restart the API (`docker compose restart api`).
 
 Example request:
@@ -475,9 +518,9 @@ uv run ruff check .      # make lint
 2. **docker**: builds the API image with layer caching (needs lint-test to pass)
 
 `.github/workflows/retrain.yml` retrains every Monday (and on demand from the Actions tab): it downloads
-the data, runs ingestion, validation and features, tunes and trains LightGBM on the CPU, evaluates it and
-registers it on a remote MLflow server, moving `@champion` only if the new model beats the current one on
-valid PR-AUC. It needs the `KAGGLE_API_TOKEN` and `MLFLOW_TRACKING_URI` secrets (plus credentials if the
+the data, runs ingestion, validation and features, tunes and trains the research LightGBM on the CPU,
+then builds the production model and registers it on a remote MLflow server, moving `@champion` only if
+the new model beats the current one on holdout PR-AUC. It needs the `KAGGLE_API_TOKEN` and `MLFLOW_TRACKING_URI` secrets (plus credentials if the
 server needs them) and skips with a notice without them. The MLflow server must serve artifacts, so the
 API can load what CI registered.
 
@@ -532,6 +575,11 @@ small "compact" trees. Valid PR-AUC, tuned params:
 - Serving speed is decided by the code path, not the feature count. On the API's NumPy fast path,
   LightGBM scores a raw row in **~2 ms (0.8 ms single-threaded)**. The other model types need a
   pandas DataFrame and take ~20–65 ms (~20–40 ms single-threaded; `make serving-latency`).
+
+The study ranks features by a model early-stopped on valid and scores the top-N runs on the same
+valid, so its numbers lean slightly optimistic. That is accepted: the research track keeps every
+labelled day for training, which is what the Kaggle score needs. The production
+[holdout](#research-vs-production) gives the honest number for the configuration you pick.
 
 Details: [Modeling approach](docs/06_modeling_approach.md#how-many-features-are-needed) and
 [Serving API](docs/07_serving_api.md#latency-per-model-type).

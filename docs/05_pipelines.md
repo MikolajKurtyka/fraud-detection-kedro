@@ -14,19 +14,19 @@ nodes to catalog datasets and parameters). `pipeline_registry.py` registers them
 | `data_validation` | Done | 1 | `kedro run --pipelines data_validation` (`make validate`) |
 | `data_cleaning` | Done | 5 | `kedro run --pipelines data_cleaning` |
 | `feature_engineering` | Done | 10 | `kedro run --pipelines feature_engineering` |
-| `training` | Done | 24 (4 per model, 6 models) | `kedro run --pipelines training` (`make train`) |
+| `training` | Done | 24 (4 per model, 6 models) | `kedro run --pipelines training` (`make train` adds `evaluation`) |
 | `training_lightgbm` / `_xgboost` / `_catboost` / `_logreg` / `_random_forest` / `_hist_gb` | Done | 4 | One model only. Not part of `__default__` |
 | `evaluation` | Done | 16 (2 per model, + SHAP for the 3 boosting models, + blend) | `kedro run --pipelines evaluation` (`make evaluate`) |
-| `serving` | Done | 1 | `kedro run --pipelines serving` (`make register`) |
-| `serving_xgboost` / `_catboost` / ... | Done | 1 | Register another model type. Not part of `__default__` |
-| `__default__` | — | all of the above except `training_*` / `serving_*` | `kedro run` (`make run`) |
+| `production` | Done | 11 | `kedro run --pipelines production` (`make production`): the Kaggle + API model, LightGBM |
+| `production_xgboost` / `_catboost` / ... | Done | 11 | The production model from another model type (`make production MODEL=xgboost`). Not part of `__default__` |
+| `__default__` | — | all of the above except `training_*` / `production_*` | `kedro run` (`make run`) |
 
 Useful variations:
 
 ```bash
 uv run kedro run --pipelines data_cleaning,feature_engineering   # make features
 uv run kedro run --pipelines training --params "lightgbm.model_options.n_trials=0,xgboost.model_options.n_trials=0,catboost.model_options.n_trials=0"   # make train-fast
-uv run kedro run --tags features            # by tag: ingestion | validation | cleaning | features | training | evaluation | serving | lightgbm …
+uv run kedro run --tags features            # by tag: ingestion | validation | cleaning | features | training | evaluation | production | lightgbm …
 uv run kedro run --pipelines training,evaluation --namespaces logreg,random_forest,hist_gb   # make baselines
 uv run kedro run --from-nodes fit_feature_encoders   # resume from a node
 uv run kedro viz run                        # interactive graph of everything below
@@ -110,10 +110,11 @@ flowchart TB
     TRAIN -->|model| CV --> REP
     TRAIN -->|model| REFIT --> MOD
 
-    MOD & MDL --> EVAL["evaluation<br/>4 thresholds incl. min cost, curves,<br/>SHAP, Kaggle submissions + blend"]
-    EVAL -->|"{model}.evaluation<br/>(threshold, PR-AUC)"| SERVE["serving<br/>register_model"]
-    MOD & CF & FE --> SERVE
-    SERVE --> REG[("MLflow registry<br/>@champion")]
+    MOD & MDL --> EVAL["evaluation (research)<br/>4 thresholds incl. min cost, curves,<br/>SHAP, Kaggle submissions + blend"]
+    MOD & REP -->|"best_params,<br/>feature_importance"| PROD["production<br/>top-N features, holdout,<br/>refit, register_model"]
+    MDL & CF & FE --> PROD
+    PROD --> SUB["submission_production.csv"]
+    PROD --> REG[("MLflow registry<br/>@champion")]
 ```
 
 Parallelogram nodes (`/…/`) are **fitted artifacts**. They are learned once from the train split
@@ -331,10 +332,10 @@ flowchart LR
 
 | Node | Function | What it does |
 |---|---|---|
-| `{model}.tune_hyperparameters` | `tune_hyperparameters` | With `n_trials: 0`, returns the base `params`. Otherwise runs an Optuna TPE search (seed 42) over `search_space`, merged on top of `params`. Each trial is fitted with early stopping on valid and scored by `tuning_metric` (`pr_auc`), stopping at `n_trials` or `timeout_minutes`. Each trial is logged as a nested MLflow run |
-| `{model}.train_model` | `train_model` | Final fit with early stopping on valid. Computes train/valid ROC-AUC and PR-AUC, `roc_auc_gap`, `best_iteration`, `n_features`, `fit_seconds`, and feature importance (gain / impurity, or permutation importance on valid for models without a built-in one). Logged to a nested MLflow run |
+| `{model}.tune_hyperparameters` | `tune_hyperparameters` | With `n_trials: 0`, returns the base `params`. Otherwise runs an Optuna TPE search (seed 42) over `search_space`, merged on top of `params`. Each trial is fitted with early stopping on valid and scored by `tuning_metric` (`pr_auc`), stopping at `n_trials` or `timeout_minutes`. Each trial is logged as a nested MLflow run (params and metrics, no model) |
+| `{model}.train_model` | `train_model` | Final fit with early stopping on valid. Computes train/valid ROC-AUC and PR-AUC, `roc_auc_gap`, `best_iteration`, `n_features`, `fit_seconds`, and feature importance (gain / impurity, or permutation importance on valid for models without a built-in one). Logged to a nested MLflow run, with the pickle as `model/model.pkl` |
 | `{model}.cross_validate` | `cross_validate` | Only with `cv_folds > 0`: expanding-window time-series CV over train + valid (rows ordered by `TransactionID`). Mean ± std of ROC-AUC / PR-AUC go to `{model}_cv_metrics.json` and the model's MLflow run (`cv_*`). With `cv_folds: 0` it returns `{"cv_folds": 0}` immediately |
-| `{model}.refit_model` | `refit_model` | With `refit: true`: refits on train + valid with `best_iteration × refit_iteration_multiplier` trees (no early stopping, nothing is left to stop on). Saved as `{model}_final.pkl` and used for the test submission. Logs `refit_rows`, `refit_iterations`, `refit_seconds` to the model's MLflow run |
+| `{model}.refit_model` | `refit_model` | With `refit: true`: refits on train + valid with `best_iteration × refit_iteration_multiplier` trees (no early stopping, nothing is left to stop on). Saved as `{model}_final.pkl` and used for the test submission. Logs `refit_rows`, `refit_iterations`, `refit_seconds` and the pickle (`model/final_model.pkl`) to the model's MLflow run |
 
 `FraudModel` (`training/model.py`) wraps all six model types behind one
 `fit(X, y, X_valid=None, y_valid=None, n_iterations=None)` / `predict_proba(X)` interface.
@@ -408,30 +409,56 @@ LightGBM the minimum is 0.077 at $2,764 per 1k transactions, against $3,147 at 1
 0.5 and $5,156 with no model.
 
 The best-F1 and min-cost thresholds are picked on valid itself, so their numbers are slightly
-optimistic. Registering the model with its threshold and moving `@champion` is done by the
-`serving` pipeline (next section).
+optimistic. The production pipeline (next section) reuses this node on its own valid part and
+reports the stored threshold on a holdout.
 
 ---
 
-## serving
+## production
 
-**06_models + fitted artifacts + evaluation → MLflow registry.** One node, `register_model`. The
-model type is chosen by pipeline name: `serving` registers LightGBM, `serving_<model>` another type.
+**Research outputs + 05_model_input → 07_model_output + MLflow registry.** The research pipelines
+compare every model on all features; this one builds the **single** model used for both the Kaggle
+submission and the API. The model type is chosen by pipeline name: `production` uses LightGBM,
+`production_<model>` another type. Datasets live in the `production` namespace
+(`production.model`, `production.evaluation`, ...), so the `{model}.*` catalog entries write
+`production.pkl`, `production_evaluation.json`, `submission_production.csv` and so on.
 
 ```mermaid
 flowchart TB
-    M["{model}.model<br/>(train only)"] & CF[/column_filter/] & FE[/feature_encoders/] --> B["InferenceBundle"]
-    EV["{model}.evaluation"] --> T["threshold = evaluation[threshold_metric]<br/>score = evaluation[promotion_metric]"]
-    B & T --> L["mlflow.pyfunc.log_model(FraudPyfunc)<br/>→ new version of fraud-detection<br/>metadata + tags: threshold, cost_per_1k,<br/>model_type, pr_auc, training_run_id"]
-    L --> Q{"no @champion yet, or<br/>score > champion's score?"}
-    Q -->|yes| P["@champion → new version"]
-    Q -->|no| K["@champion kept"]
-    P & K --> R["serving_registration.json"]
+    FI["{model}.feature_importance"] --> SF["select_features<br/>top n_features"] --> F[/production.features/]
+    BP["{model}.best_params"] & O[/"params:{model}.model_options"/] --> PO["production_options<br/>+ param_overrides"]
+    TR[mdl_in_train] & F --> ST["subset_columns_train"]
+    VA[mdl_in_valid] --> SH["split_holdout<br/>by TransactionID"]
+    SH -->|earlier half| PV[prod_valid]
+    SH -->|later half| HO[prod_holdout]
+    ST & PV & PO --> T["train_model<br/>early stopping on prod_valid"] --> M["production.model"]
+    M & PV --> E["evaluate_model<br/>threshold picked here"]
+    M & HO & E --> H["evaluate_holdout<br/>metrics at that threshold,<br/>latency, n_features"] --> EV["production.evaluation"]
+    ST & VA & F --> R["refit_model<br/>train + all of valid"] --> FM["production.final_model"] --> S["submission_production.csv"]
+    M & EV & CF[/column_filter/] & FE[/feature_encoders/] --> REG["register_model<br/>@champion if holdout_pr_auc wins"]
 ```
 
 | Node | Function | What it does |
 |---|---|---|
-| `register_{model}` | `register_model` | Fails early if `threshold_metric` is missing from the evaluation (run `make evaluate` first). Inside a kedro run: logs the bundle as an MLflow pyfunc, registers it as `fraud-detection`, tags the version, moves the alias if it wins. Outside a run (tests) it only returns the summary |
+| `select_features` | `production/nodes.py` | Top `n_features` of the research model's importance (`null` = all). Saved to `production_features.json` |
+| `production_options` | `production/nodes.py` | Research `model_options` + `best_params` + `param_overrides`; names the MLflow run `production-{model}` (stage `production`) |
+| `subset_columns_train` / `_valid` | `production/nodes.py` | ID + target + the chosen features, for fitting only. Valid, holdout and test keep every column: `predict_proba` selects the model's own columns, and the cost metrics need `TransactionAmt` even when it is not a feature |
+| `split_holdout` | `production/nodes.py` | Sorts valid by `TransactionID` (it grows with time) and keeps the last `holdout_fraction` as the holdout |
+| `train_model` | reused from `training` | Fit on train, early stopping on `prod_valid`; model pickle logged to the run |
+| `evaluate_model` | reused from `evaluation` | All four thresholds on `prod_valid`; `serving.threshold_metric` picks the one stored with the model |
+| `evaluate_holdout` | `production/nodes.py` | ROC-AUC, PR-AUC, precision / recall / FPR / counts and cost per 1k on the holdout **at the valid threshold**, plus `n_features` and one-row `predict_proba` latency p50 / p99. Merged into the valid evaluation as `holdout_*` keys and logged to the run |
+| `refit_model` | reused from `training` | Train + all of valid, `best_iteration × refit_iteration_multiplier` trees → `production_final.pkl` |
+| `predict_submission` | reused from `evaluation` | `submission_production.csv`, the file to upload to Kaggle |
+| `register_model` | `serving/nodes.py` | Logs the train-only model with the column filter and encoders as one MLflow pyfunc (`InferenceBundle`), registers it as `fraud-detection`, tags it, moves `@champion` if it wins. Outside a kedro run (tests) it only returns the summary |
+
+**Parameters** (`parameters_production.yml`):
+
+| Key | Value | Note |
+|---|---|---|
+| `n_features` | 100 | Top-N by the research importance; pick it from the feature-size study |
+| `holdout_fraction` | 0.5 | Share of valid (its later days) kept as the holdout |
+| `param_overrides` | `{}` | On top of the research `best_params`, e.g. `{num_leaves: 31, max_depth: 6}` |
+| `latency_rows` | 500 | Holdout rows timed one by one |
 
 **Parameters** (`parameters_serving.yml`):
 
@@ -439,13 +466,14 @@ flowchart TB
 |---|---|---|
 | `registered_model_name` | `fraud-detection` | The name the API's `MODEL_URI` points to |
 | `alias` | `champion` | The alias the API serves |
-| `threshold_metric` | `min_cost_threshold` | Which evaluation threshold is stored with the model. Alternatives: `at_fpr_threshold`, `best_f1_threshold`, `fixed_threshold` |
-| `promotion_metric` | `pr_auc` | Must be *higher is better*: the comparison is `score > champion` |
+| `threshold_metric` | `min_cost_threshold` | Which valid threshold is stored with the model. Alternatives: `at_fpr_threshold`, `best_f1_threshold`, `fixed_threshold` |
+| `promotion_metric` | `holdout_pr_auc` | Must be *higher is better*: the comparison is `score > champion`. A champion registered before (no `holdout_pr_auc` tag) counts as no champion |
 
-The registered model is the **train-only** `{model}.model`, so its threshold and metrics were
-measured on data it did not train on. Champion and challenger are compared on the scores stored
-when each was registered; that is fair only while the validation days stay the same (see
-[limitations](06_modeling_approach.md#known-limitations)).
+The registered model is the **train-only** `production.model`, so its threshold was picked for it.
+The holdout is mostly clean, not perfectly clean: the research `best_params` and the feature
+ranking were chosen on the full valid, which includes the holdout days (see
+[limitations](06_modeling_approach.md#known-limitations)). Champion and challenger are compared on
+the scores stored when each was registered; that is fair only while the holdout days stay the same.
 
 ---
 
@@ -458,6 +486,7 @@ when each was registered; that is fair only while the validation days stay the s
 | `tests/pipelines/test_data_cleaning.py` | Time ordering of the split, each filter rule, protected columns, single-row apply, missing-column error |
 | `tests/pipelines/test_feature_engineering.py` | Stateless features, native vs coded encodings, **single row = batch**, unseen values |
 | `tests/pipelines/test_training.py` | All six models train on CPU and score one row; class weights and undersampling (train only); refit tree count and `refit: false`; expanding CV folds; Optuna merges params; `n_trials=0` path |
+| `tests/pipelines/test_production.py` | Top-N feature selection; fitting frames keep ID + target; the holdout is the latest rows; param overrides and run name; holdout metrics use the valid threshold; the whole pipeline end to end (model and refit on the chosen features, submission, registration summary); a production pipeline per model type |
 | `tests/pipelines/test_evaluation.py` | Threshold metrics; the min-cost threshold equals a brute-force search; SHAP values add up to the prediction; SHAP ranks the signal first; submission format, rank-average blend; the blend uses only boosting models and submissions use `final_model` |
 | `tests/test_inference.py` | `InferenceBundle` reproduces the batch model input and scores (single rows too); bad rows raise; the NumPy fast path equals the pandas path for every batch size and model type; pyfunc round trip; registration promotes only better models; `/explain` contributions add up to the score |
 | `tests/api/test_api.py` | Liveness/readiness with and without a model, warm-up, single and batch scoring (order, size limits), threshold precedence, 422/500 error mapping, request-ID and timing headers, prediction log, `/metrics`, `/explain` |

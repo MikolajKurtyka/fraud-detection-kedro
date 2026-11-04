@@ -4,8 +4,9 @@ BATCHES ?= 1 10 100 1000
 DURATION ?= 60
 CLIENTS ?= 1
 WORKERS ?= 4
+MODEL ?= lightgbm
 
-.PHONY: help setup data ingest validate features train train-fast baselines evaluate register compare feature-study serving-latency run viz mlflow api api-prod loadtest test lint format docker-up docker-down clean
+.PHONY: help setup data ingest validate features train train-fast baselines evaluate production compare feature-study serving-latency run viz mlflow api api-prod loadtest test lint format docker-up docker-down clean
 
 help:  ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -25,8 +26,8 @@ validate:  ## pandera checks on the ingested tables -> data/08_reporting/data_va
 features:  ## Run cleaning + feature engineering (02 -> 05)
 	uv run kedro run --pipelines data_cleaning,feature_engineering
 
-train:  ## Tune + train all models, evaluate, write submissions, register LightGBM for the API
-	uv run kedro run --pipelines training,evaluation,serving
+train:  ## Research: tune + train all models on all features, evaluate, write their submissions
+	uv run kedro run --pipelines training,evaluation
 
 train-fast:  ## Same, but train once with base params (no tuning)
 	uv run kedro run --pipelines training,evaluation --params "lightgbm.model_options.n_trials=0,xgboost.model_options.n_trials=0,catboost.model_options.n_trials=0"
@@ -37,8 +38,8 @@ baselines:  ## Train + evaluate only the baselines (logreg, random_forest, hist_
 evaluate:  ## Metrics, curves and Kaggle submissions for the saved models
 	uv run kedro run --pipelines evaluation
 
-register:  ## Register the saved LightGBM in MLflow; @champion moves if it beats the current one
-	uv run kedro run --pipelines serving
+production:  ## Production model (MODEL, top-N features, holdout) -> submission_production.csv + MLflow @champion
+	uv run kedro run --pipelines production_$(MODEL)
 
 compare:  ## History of all trained models from MLflow as a table
 	uv run python scripts/compare_runs.py
