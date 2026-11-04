@@ -90,7 +90,7 @@ The key ideas:
 | `evaluation`: cost-based threshold (stored with the model, used by the API), global SHAP importance | Done |
 | Per-prediction SHAP explanations (`POST /explain`) | Done |
 | Weekly retraining workflow against a remote MLflow | Done; needs a hosted MLflow server and secrets |
-| `production`: one chosen model on its top-N features, honest holdout, the Kaggle submission and the API model; `@champion` moves only if holdout PR-AUC improves (`make production`) | Done |
+| `production`: a few candidates (model type + top-N features) on an honest holdout; one is chosen by latency, PR-AUC and feature count and becomes the Kaggle submission and the API model; `@champion` moves only if holdout PR-AUC improves (`make production`) | Done |
 | Every trained model (train-only and refit) stored in its MLflow run | Done |
 
 **Latest results**: all models use their base `params` (no Optuna tuning yet). Validation is

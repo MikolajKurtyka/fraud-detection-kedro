@@ -84,7 +84,7 @@ fraud-detection-kedro/
 │   ├── local/                         # machine overrides + secrets (git-ignored)
 │   └── logging.yml                    # console (rich) + logs/info.log, logs/errors.log
 ├── data/                              # git-ignored, see 04_data_layers.md
-├── docker/mlflow.Dockerfile           # MLflow server image (+ psycopg2)
+├── docker/mlflow.Dockerfile           # MLflow server image (+ psycopg 3)
 ├── docs/                              # this documentation
 ├── notebooks/                         # exploration only, no pipeline logic
 ├── scripts/
@@ -247,7 +247,7 @@ columns cover training, CV, refit and `eval_*` metrics; any column a run didn't 
 | Image | File | Contents |
 |---|---|---|
 | API | `Dockerfile` | Multi-stage. The **builder** stage runs `uv sync --frozen --no-dev` (dependencies are cached in their own layer before the source is copied). The **runtime** stage is `python:3.12-slim` + `libgomp1` (needed by LightGBM) + the virtualenv. It runs as the non-root `app` user, and its `HEALTHCHECK` hits `/health/live` (liveness only: the container counts as healthy even without a model). It starts `uvicorn` on port 8000 with `WEB_CONCURRENCY` workers (default 4) and `--no-access-log` (the app's middleware logs requests). It also sets `OMP_NUM_THREADS=1` and resets `PROMETHEUS_MULTIPROC_DIR` at start |
-| MLflow | `docker/mlflow.Dockerfile` | `python:3.12-slim` + `mlflow>=3.5,<4` + `psycopg2-binary` |
+| MLflow | `docker/mlflow.Dockerfile` | `python:3.12-slim` + `mlflow>=3.5,<4` + `psycopg[binary]` (psycopg 3, named in the URI as `postgresql+psycopg://`) |
 
 ### docker compose services
 
@@ -326,7 +326,9 @@ The API picks up a new champion on its next restart.
 | `make train-fast` | `… training,evaluation --params "*.n_trials=0"` | Train and evaluate once with the base params, no tuning |
 | `make baselines` | `… --namespaces logreg,random_forest,hist_gb` | Train and evaluate only the three baselines |
 | `make evaluate` | `kedro run --pipelines evaluation` | Metrics, cost threshold, curves, SHAP and submissions for the saved models |
-| `make production` | `kedro run --pipelines production_$(MODEL)` | The Kaggle + API model (`MODEL=lightgbm` by default): top-N features, holdout report, `submission_production.csv`, register; `@champion` moves if holdout PR-AUC beats the current one |
+| `make production` | `kedro run --pipelines production` | Every production candidate (holdout report, own submission), then the choice: `submission_production.csv`, register; `@champion` moves if holdout PR-AUC beats the current one |
+| `make candidate` | `kedro run --pipelines production_$(CANDIDATE)` | One candidate (`CANDIDATE=lightgbm_100` by default) → `submission_production_<candidate>.csv`; registers nothing |
+| `make choose` | `kedro run --pipelines production_choose` | The choice again from the saved candidate results |
 | `make compare` | `scripts/compare_runs.py` | Run history table from MLflow |
 | `make feature-study` | `scripts/feature_size_study.py` | Accuracy, model size and latency vs number of features |
 | `make serving-latency` | `scripts/serving_latency.py` | Single-row latency of every saved model: pandas vs NumPy path, default threads vs one thread |

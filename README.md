@@ -33,7 +33,7 @@ and a containerised FastAPI scoring service.
 | NumPy fast path for serving (`fast_inference.py`, ~2 ms per row, bit-identical to the pandas path) | Done |
 | Open-loop async load test, 1–10000 requests/min × 1–1000 rows (`make loadtest`) | Done |
 | Feature-count study (accuracy / size / latency vs top-N features, all 6 models) and per-model serving latency (`make feature-study`, `make serving-latency`) | Done |
-| `production`: one chosen model on its top-N features, honest holdout, the Kaggle submission and the API model; `@champion` moves only if holdout PR-AUC improves (`make production`) | Done |
+| `production`: a few candidates (model type + top-N features) on an honest holdout; one is chosen by latency, PR-AUC and feature count and becomes the Kaggle submission and the API model; `@champion` moves only if holdout PR-AUC improves (`make production`) | Done |
 | Every trained model (train-only and refit) stored in its MLflow run, not only on disk | Done |
 | `data_validation` (pandera schemas, train/test parity) | Done |
 | Per-prediction SHAP explanations (`POST /explain`) | Done |
@@ -64,7 +64,7 @@ flowchart LR
         FE["feature_engineering<br/>D-norm, UID,<br/>aggregates, encodings"]
         TR["training<br/>3 boosting + 3 baselines<br/>Optuna, refit"]
         EV["evaluation<br/>4 thresholds incl. min cost,<br/>curves, SHAP, submissions"]
-        SV["production<br/>chosen model, top-N features,<br/>holdout → submission +<br/>MLflow pyfunc"]
+        SV["production<br/>candidates on top-N features,<br/>holdout, choose one →<br/>submission + MLflow pyfunc"]
         RAW --> ING --> VAL
         ING --> CLN --> FE --> TR --> EV
         TR -->|"best params,<br/>feature ranking"| SV
@@ -85,7 +85,7 @@ flowchart LR
 ```
 
 GitHub Actions: `ci.yml` runs lint → tests → Kedro load check → Docker image build on every push and
-PR; `retrain.yml` retrains LightGBM and registers the production model every Monday.
+PR; `retrain.yml` retrains the boosting models and the production candidates every Monday.
 
 ## Key Components
 
@@ -99,7 +99,7 @@ PR; `retrain.yml` retrains LightGBM and registers the production model every Mon
 | `feature_engineering` | `03` → `04_feature` → `05_model_input` | Time features, normalized D columns, email parts, client UID proxy, group-ratio / frequency / UID aggregates and category encodings fitted on train |
 | `training` | `05` → `06_models` | LightGBM, XGBoost (GPU), CatBoost (GPU) with Optuna tuning, plus logistic regression, random forest and HistGradientBoosting baselines; early stopping on valid, optional time-series CV, refit on train + valid for the submission; one nested MLflow run per model |
 | `evaluation` | `06` → `08_reporting` | Precision / recall / F1 at 4 thresholds incl. the cost-optimal one, PR + ROC + cost curves, global SHAP importance (boosting models), Kaggle submissions per model + blend |
-| `production` | research `06` / `08` + `05` → `07` + MLflow registry | One model type (LightGBM by default) with its tuned params on its top-N features. Splits valid into valid + holdout, reports on the holdout, refits for `submission_production.csv`, wraps the model with its column filter and encoders as an MLflow pyfunc, moves `@champion` only if holdout PR-AUC improves |
+| `production` | research `06` / `08` + `05` → `07` + MLflow registry | A few candidates, each a model type with its tuned params on its top-N features. Splits valid into valid + holdout, reports each candidate on the holdout and refits it for its own submission. Chooses one (latency budget, best holdout PR-AUC, fewest features within a tolerance), copies its file to `submission_production.csv`, wraps it with its column filter and encoders as an MLflow pyfunc, moves `@champion` only if holdout PR-AUC improves |
 
 **MLflow** (through `kedro-mlflow`) records parameters, metrics and artifacts for every `kedro run`.
 Every trained model is stored in its own run (`model/model.pkl`, `model/final_model.pkl`), so
@@ -248,7 +248,7 @@ uv run kedro run --pipelines data_ingestion                      # make ingest
 uv run kedro run --pipelines data_validation                     # make validate
 uv run kedro run --pipelines data_cleaning,feature_engineering   # make features
 uv run kedro run --pipelines training                            # 3 boosting models + Optuna, 3 baselines
-uv run kedro run --pipelines production                          # make production: the Kaggle + API model
+uv run kedro run --pipelines production                          # make production: candidates, choose the Kaggle + API model
 uv run kedro run                                                 # make run (all pipelines)
 uv run kedro registry list                                       # list pipelines
 uv run kedro viz run                                             # make viz: interactive pipeline graph
@@ -266,7 +266,7 @@ uv run kedro run --pipelines data_validation                     #    pandera ch
 uv run kedro run --pipelines data_cleaning,feature_engineering   # 3. split, filter, features (~2 min)
 uv run kedro run --pipelines training,evaluation                 # 4. research: tune + train all models, evaluate, submissions (up to ~3 h)
 uv run python scripts/compare_runs.py                            # 5. results table of all runs
-uv run kedro run --pipelines production                          # 6. production model: holdout report, submission, registry
+uv run kedro run --pipelines production                          # 6. production: candidates, holdout reports, choice, registry
 ```
 
 Step 4 without tuning (~8 min): add
@@ -335,7 +335,8 @@ model ([below](#research-vs-production)). The evaluation pipeline also scores th
 
 | File | Model |
 |---|---|
-| `data/07_model_output/submission_production.csv` | **Production model** (chosen model type, top-N features) |
+| `data/07_model_output/submission_production.csv` | **Production model** (the chosen candidate) |
+| `data/07_model_output/submission_production_<candidate>.csv` | Each production candidate, e.g. `submission_production_xgboost_200.csv` |
 | `data/07_model_output/submission_lightgbm.csv` | LightGBM |
 | `data/07_model_output/submission_xgboost.csv` | XGBoost |
 | `data/07_model_output/submission_catboost.csv` | CatBoost |
@@ -363,32 +364,58 @@ The project has two tracks:
 | | Research (`training`, `evaluation`, scripts) | Production (`production`) |
 |---|---|---|
 | Purpose | Show what was tried: 6 models, all 395 features, Optuna, feature-size study | One model for both the Kaggle submission and the API |
-| Model | Every model type | One type (`production` = LightGBM, `production_<model>` another) |
-| Features | All | Top `n_features` of the research model's importance (default 100) |
+| Models | Every model type | A short list of **candidates**, e.g. `lightgbm_100`, `xgboost_200` |
+| Features | All | Each candidate's top `n_features` of its model's research importance |
 | Params | Optuna search | The research `best_params`, plus optional `param_overrides` (e.g. smaller trees) |
 | Scored on | Valid (also used for early stopping and tuning, so optimistic) | A **holdout**: the later half of valid, never fitted, early-stopped or picked on |
-| Output | `submission_<model>.csv`, reports | `submission_production.csv`, MLflow `@champion` |
+| Output | `submission_<model>.csv`, reports | One submission per candidate; the chosen one as `submission_production.csv` and MLflow `@champion` |
 
-Production reads the research outputs of its model type live (`<model>_best_params.json`,
-`<model>_feature_importance.csv`), so run the research training for that model first. Settings are
-in `conf/base/parameters_production.yml`: choose `n_features` and `param_overrides` from the
-[feature-size study](#fewer-features-smaller-models-faster-serving). Fewer features and smaller
-trees are better as long as holdout PR-AUC holds.
+The candidates are listed in `conf/base/parameters_production.yml`; pick them from the
+[feature-size study](#fewer-features-smaller-models-faster-serving) rather than trying every model
+at every size (that would take many hours, and choosing among many on the holdout makes it
+optimistic too). Each candidate reads the research outputs of its model type live
+(`<model>_best_params.json`, `<model>_feature_importance.csv`), so train that model first.
 
-```bash
-uv run kedro run --pipelines production                 # make production (LightGBM)
-uv run kedro run --pipelines production_xgboost         # make production MODEL=xgboost
-uv run kedro run --pipelines production --params "production.n_features=50"
+```yaml
+production:
+  candidates:
+    lightgbm_100: {model: lightgbm, n_features: 100}
+    lightgbm_50: {model: lightgbm, n_features: 50}
+    xgboost_200: {model: xgboost, n_features: 200}
+    catboost_100: {model: catboost, n_features: 100}
+  selection:
+    max_latency_p99_ms: 20    # one-row model latency budget
+    pr_auc_tolerance: 0.005   # this close to the best counts as equally good
 ```
 
-`data/08_reporting/production_evaluation.json` has the valid metrics (where the threshold is
-picked) and the `holdout_*` metrics at that threshold, plus `n_features` and the one-row model
-latency (`latency_p50_ms`, `latency_p99_ms`). `@champion` moves only if `holdout_pr_auc` beats the
-current champion. The API serves the train-only model, because its threshold was picked for it;
-Kaggle gets the same config refitted on all labelled data.
+The choice, from the candidates' holdout reports:
+
+1. drop the candidates whose one-row p99 latency is above `max_latency_p99_ms`;
+2. take the best holdout PR-AUC among the rest;
+3. of the candidates within `pr_auc_tolerance` of it, take the one with the fewest features.
+
+So a smaller model wins when it is as good as the best one, and a slow model never reaches the API.
+The chosen candidate's train-only model is registered (the API serves it, because its threshold was
+picked for it) and `@champion` moves to it only if its `holdout_pr_auc` beats the current champion.
+Its refit on all labelled data becomes `submission_production.csv`.
+
+```bash
+uv run kedro run --pipelines production                   # make production: every candidate + the choice
+uv run kedro run --pipelines production_xgboost_200       # make candidate CANDIDATE=xgboost_200 (registers nothing)
+uv run kedro run --pipelines production_choose            # make choose: choose again from the saved results
+```
+
+| Output | What it holds |
+|---|---|
+| `data/08_reporting/production_candidates.md` | Every candidate side by side: holdout PR-AUC / ROC-AUC, cost per 1k, features, latency, which one was chosen |
+| `data/08_reporting/production_choice.json` | The chosen candidate and the rule's inputs |
+| `data/08_reporting/production_<candidate>_evaluation.json` | One candidate's valid metrics (where the threshold is picked) and `holdout_*` metrics at that threshold, `n_features`, `latency_p50_ms` / `latency_p99_ms` |
+| `data/06_models/production_<candidate>.pkl`, `_final.pkl`, `_features.json` | Its train-only model, its refit, its feature list |
+| `data/07_model_output/submission_production_<candidate>.csv` | Its Kaggle file |
 
 The holdout is mostly clean, not perfectly clean: the research params and the feature ranking were
-chosen on the full valid, which includes the holdout days.
+chosen on the full valid, which includes the holdout days, and choosing among a few candidates on
+it adds a little optimism to the winner's number.
 
 ### Watching a run
 
@@ -518,9 +545,10 @@ uv run ruff check .      # make lint
 2. **docker**: builds the API image with layer caching (needs lint-test to pass)
 
 `.github/workflows/retrain.yml` retrains every Monday (and on demand from the Actions tab): it downloads
-the data, runs ingestion, validation and features, tunes and trains the research LightGBM on the CPU,
-then builds the production model and registers it on a remote MLflow server, moving `@champion` only if
-the new model beats the current one on holdout PR-AUC. It needs the `KAGGLE_API_TOKEN` and `MLFLOW_TRACKING_URI` secrets (plus credentials if the
+the data, runs ingestion, validation and features, tunes and trains the research LightGBM, XGBoost and
+CatBoost on the CPU (5 trials each by default), then builds the production candidates, chooses one and
+registers it on a remote MLflow server, moving `@champion` only if it beats the current one on holdout
+PR-AUC. It needs the `KAGGLE_API_TOKEN` and `MLFLOW_TRACKING_URI` secrets (plus credentials if the
 server needs them) and skips with a notice without them. The MLflow server must serve artifacts, so the
 API can load what CI registered.
 
@@ -574,15 +602,72 @@ small "compact" trees. Valid PR-AUC, tuned params:
   (1.5–5 MB) for 0.01–0.04 less PR-AUC.
 - Serving speed is decided by the code path, not the feature count. On the API's NumPy fast path,
   LightGBM scores a raw row in **~2 ms (0.8 ms single-threaded)**. The other model types need a
-  pandas DataFrame and take ~20–65 ms (~20–40 ms single-threaded; `make serving-latency`).
+  pandas DataFrame and take ~20–65 ms (~20–40 ms single-threaded; `make serving-latency`). See
+  [Speed analysis](#speed-analysis-data-handling-model-features).
 
 The study ranks features by a model early-stopped on valid and scores the top-N runs on the same
 valid, so its numbers lean slightly optimistic. That is accepted: the research track keeps every
 labelled day for training, which is what the Kaggle score needs. The production
-[holdout](#research-vs-production) gives the honest number for the configuration you pick.
+[holdout](#research-vs-production) gives the honest number for each candidate you pick from it.
 
 Details: [Modeling approach](docs/06_modeling_approach.md#how-many-features-are-needed) and
 [Serving API](docs/07_serving_api.md#latency-per-model-type).
+
+### Speed analysis: data handling, model, features
+
+Scoring one raw transaction has two parts: **building the features** from the raw row (types,
+column filter, time features, encoders, UID aggregates) and **running the model**. Three choices
+set the time, in this order of impact:
+
+| Lever | Options | One-row effect |
+|---|---|---|
+| 1. Data handling | pandas DataFrame vs NumPy arrays | **~110–185 ms → ~2–65 ms** |
+| 2. Model type | LightGBM vs XGBoost / CatBoost / HistGB / RF / LogReg | **~2 ms vs ~20–65 ms** on the NumPy path |
+| 3. Number of features | 395 → 100 → 50 | model time roughly **÷2** |
+
+**1 + 2. Data handling and model type** (`make serving-latency`, all 395 features, one row,
+p50 in ms, `data/08_reporting/serving_latency.csv`):
+
+| Model | pandas path | NumPy fast path | NumPy, 1 thread | Model only, 1 thread |
+|---|---|---|---|---|
+| **LightGBM** | 166 | 2.0 | **0.8** | 7.6 |
+| CatBoost | 110 | 19 | 18 | 12 |
+| XGBoost | 172 | 51 | 22 | 14 |
+| HistGB | 185 | 66 | 24 | 15 |
+| Random forest | 138 | 61 | 26 | 20 |
+| Logistic regression | 114 | 40 | 38 | 33 |
+
+- **pandas is the bottleneck, not the model.** The pandas path (`InferenceBundle.predict_proba`,
+  the same node functions the batch pipelines use) makes thousands of small pandas calls, each with
+  ~0.1–1 ms of fixed overhead, so one row costs ~110–185 ms whatever the model. The NumPy fast path
+  (`fast_inference.py`, used by the API) does the same steps on arrays and dict lookups and gives
+  **bit-identical scores** (tested in `tests/test_inference.py`).
+- **LightGBM is the only model that stays NumPy end to end**: it takes the float matrix directly.
+  The others need a DataFrame with category dtypes rebuilt from it, which adds 10–35 ms.
+- **Threads hurt single rows.** Default `n_jobs=-1` / OpenMP starts a thread pool per call; one
+  thread is 2–3× faster for XGBoost, HistGB and random forest.
+
+**3. Number of features** (`make feature-study`, tuned params, model time on one row, p50 in ms):
+
+| Model | 395 features | 200 | 100 | 50 | 25 |
+|---|---|---|---|---|---|
+| LightGBM | 21.8 | 16.1 | 11.1 | 9.5 | 5.2 |
+| XGBoost | 45.4 | 21.0 | 16.6 | 12.1 | 8.2 |
+| CatBoost | 14.6 | 8.8 | 4.8 | 3.1 | 2.1 |
+| HistGB | 50.6 | 55.1 | 40.8 | 31.9 | 31.1 |
+| Random forest | 57.2 | 57.6 | 47.3 | 45.0 | 44.0 |
+| Logistic regression | 35.0 | 24.9 | 11.0 | 6.3 | 3.9 |
+
+- Going from 395 to 100 features roughly halves the model time and costs ≤0.002 PR-AUC for LightGBM and
+  XGBoost (0.016 for CatBoost)
+  ([above](#fewer-features-smaller-models-faster-serving)), but it does not touch the 100+ ms
+  pandas overhead: feature count is a fine-tuning lever, data handling is the big one.
+- These model times are measured on a DataFrame with default threads, so they are higher than
+  the NumPy / single-thread numbers in the previous table; compare within one table.
+
+Bottom line: the API serves **LightGBM on the NumPy fast path, ~2 ms per row** (~0.8 ms with one
+thread), about **80× faster** than the same model and features through pandas. Measured on one
+Windows laptop (32 threads); single runs vary by ±30%.
 
 ## Metrics Explained: What They Mean for the Business
 
@@ -703,20 +788,6 @@ are illustrative. The evaluation pipeline recomputes the cost-optimal threshold 
 See [docs/08_model_card.md](docs/08_model_card.md) for intended use, data, evaluation, limitations and fairness considerations.
 The full documentation (infrastructure, pipeline diagrams, modeling approach, API) starts at
 [docs/01_introduction.md](docs/01_introduction.md).
-
-## Contributing
-
-1. Fork the repository and create a feature branch
-2. Run `make lint test` before committing (pre-commit runs ruff automatically)
-3. Open a pull request; CI must pass
-
-## License
-
-MIT, see [LICENSE](LICENSE).
-
-## Contact
-
-Mikolaj Kurtyka
 
 ## Acknowledgments
 

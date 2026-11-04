@@ -17,8 +17,9 @@ nodes to catalog datasets and parameters). `pipeline_registry.py` registers them
 | `training` | Done | 24 (4 per model, 6 models) | `kedro run --pipelines training` (`make train` adds `evaluation`) |
 | `training_lightgbm` / `_xgboost` / `_catboost` / `_logreg` / `_random_forest` / `_hist_gb` | Done | 4 | One model only. Not part of `__default__` |
 | `evaluation` | Done | 16 (2 per model, + SHAP for the 3 boosting models, + blend) | `kedro run --pipelines evaluation` (`make evaluate`) |
-| `production` | Done | 11 | `kedro run --pipelines production` (`make production`): the Kaggle + API model, LightGBM |
-| `production_xgboost` / `_catboost` / ... | Done | 11 | The production model from another model type (`make production MODEL=xgboost`). Not part of `__default__` |
+| `production` | Done | 10 per candidate + 3 | `kedro run --pipelines production` (`make production`): every candidate, then the choice of the Kaggle + API model |
+| `production_lightgbm_100` / `_xgboost_200` / ... | Done | 10 | One candidate (`make candidate CANDIDATE=xgboost_200`), registers nothing. Not part of `__default__` |
+| `production_choose` | Done | 3 | The choice from saved candidate outputs (`make choose`). Not part of `__default__` |
 | `__default__` | — | all of the above except `training_*` / `production_*` | `kedro run` (`make run`) |
 
 Useful variations:
@@ -111,7 +112,7 @@ flowchart TB
     TRAIN -->|model| REFIT --> MOD
 
     MOD & MDL --> EVAL["evaluation (research)<br/>4 thresholds incl. min cost, curves,<br/>SHAP, Kaggle submissions + blend"]
-    MOD & REP -->|"best_params,<br/>feature_importance"| PROD["production<br/>top-N features, holdout,<br/>refit, register_model"]
+    MOD & REP -->|"best_params,<br/>feature_importance"| PROD["production<br/>candidates: top-N features,<br/>holdout, refit; choose one,<br/>register_model"]
     MDL & CF & FE --> PROD
     PROD --> SUB["submission_production.csv"]
     PROD --> REG[("MLflow registry<br/>@champion")]
@@ -417,47 +418,68 @@ reports the stored threshold on a holdout.
 ## production
 
 **Research outputs + 05_model_input → 07_model_output + MLflow registry.** The research pipelines
-compare every model on all features; this one builds the **single** model used for both the Kaggle
-submission and the API. The model type is chosen by pipeline name: `production` uses LightGBM,
-`production_<model>` another type. Datasets live in the `production` namespace
-(`production.model`, `production.evaluation`, ...), so the `{model}.*` catalog entries write
-`production.pkl`, `production_evaluation.json`, `submission_production.csv` and so on.
+compare every model on all features; this one builds a few **candidates** and chooses the
+**single** model used for both the Kaggle submission and the API. Candidates are listed in
+`production.candidates` (name → model type + `n_features`); each gets its own pipeline in the
+`production_<name>` namespace, so the `{model}.*` catalog entries write
+`production_xgboost_200.pkl`, `production_xgboost_200_evaluation.json`,
+`submission_production_xgboost_200.csv` and so on. The candidates are read from
+`parameters_production.yml` when the pipelines are built, so adding one means editing that file
+(`--params` can change a candidate, not add one).
+
+Per candidate:
 
 ```mermaid
 flowchart TB
-    FI["{model}.feature_importance"] --> SF["select_features<br/>top n_features"] --> F[/production.features/]
+    FI["{model}.feature_importance"] --> SF["select_features<br/>top n_features"] --> F[/features/]
     BP["{model}.best_params"] & O[/"params:{model}.model_options"/] --> PO["production_options<br/>+ param_overrides"]
     TR[mdl_in_train] & F --> ST["subset_columns_train"]
     VA[mdl_in_valid] --> SH["split_holdout<br/>by TransactionID"]
     SH -->|earlier half| PV[prod_valid]
     SH -->|later half| HO[prod_holdout]
-    ST & PV & PO --> T["train_model<br/>early stopping on prod_valid"] --> M["production.model"]
+    ST & PV & PO --> T["train_model<br/>early stopping on prod_valid"] --> M["model"]
     M & PV --> E["evaluate_model<br/>threshold picked here"]
-    M & HO & E --> H["evaluate_holdout<br/>metrics at that threshold,<br/>latency, n_features"] --> EV["production.evaluation"]
-    ST & VA & F --> R["refit_model<br/>train + all of valid"] --> FM["production.final_model"] --> S["submission_production.csv"]
-    M & EV & CF[/column_filter/] & FE[/feature_encoders/] --> REG["register_model<br/>@champion if holdout_pr_auc wins"]
+    M & HO & E --> H["evaluate_holdout<br/>metrics at that threshold,<br/>latency, n_features"] --> EV["evaluation"]
+    ST & VA & F --> R["refit_model<br/>train + all of valid"] --> FM["final_model"] --> S["submission"]
+```
+
+Then, over all candidates:
+
+```mermaid
+flowchart LR
+    EVS["production_&lt;name&gt;.evaluation<br/>(every candidate)"] --> C["choose_candidate<br/>latency budget → best PR-AUC<br/>→ fewest features within tolerance"]
+    C --> CH[/production.choice/] & RP["production_candidates.md"]
+    CH & MS["production_&lt;name&gt;.model"] & CF[/column_filter/] & FE[/feature_encoders/] --> REG["register_model<br/>@champion if holdout_pr_auc wins"]
+    CH & SUBS["submission_production_&lt;name&gt;.csv"] --> CP["copy_submission"] --> SUB["submission_production.csv"]
 ```
 
 | Node | Function | What it does |
 |---|---|---|
-| `select_features` | `production/nodes.py` | Top `n_features` of the research model's importance (`null` = all). Saved to `production_features.json` |
-| `production_options` | `production/nodes.py` | Research `model_options` + `best_params` + `param_overrides`; names the MLflow run `production-{model}` (stage `production`) |
+| `select_features` | `production/nodes.py` | Top `n_features` of the research model's importance (`null` = all). Saved to `production_<name>_features.json` |
+| `production_options` | `production/nodes.py` | Research `model_options` + `best_params` + the global and the candidate's `param_overrides`; names the MLflow run `production-{model}-{n_features}` (stage `production`) |
 | `subset_columns_train` / `_valid` | `production/nodes.py` | ID + target + the chosen features, for fitting only. Valid, holdout and test keep every column: `predict_proba` selects the model's own columns, and the cost metrics need `TransactionAmt` even when it is not a feature |
 | `split_holdout` | `production/nodes.py` | Sorts valid by `TransactionID` (it grows with time) and keeps the last `holdout_fraction` as the holdout |
 | `train_model` | reused from `training` | Fit on train, early stopping on `prod_valid`; model pickle logged to the run |
 | `evaluate_model` | reused from `evaluation` | All four thresholds on `prod_valid`; `serving.threshold_metric` picks the one stored with the model |
 | `evaluate_holdout` | `production/nodes.py` | ROC-AUC, PR-AUC, precision / recall / FPR / counts and cost per 1k on the holdout **at the valid threshold**, plus `n_features` and one-row `predict_proba` latency p50 / p99. Merged into the valid evaluation as `holdout_*` keys and logged to the run |
-| `refit_model` | reused from `training` | Train + all of valid, `best_iteration × refit_iteration_multiplier` trees → `production_final.pkl` |
-| `predict_submission` | reused from `evaluation` | `submission_production.csv`, the file to upload to Kaggle |
-| `register_model` | `serving/nodes.py` | Logs the train-only model with the column filter and encoders as one MLflow pyfunc (`InferenceBundle`), registers it as `fraud-detection`, tags it, moves `@champion` if it wins. Outside a kedro run (tests) it only returns the summary |
+| `refit_model` | reused from `training` | Train + all of valid, `best_iteration × refit_iteration_multiplier` trees → `production_<name>_final.pkl` |
+| `predict_submission` | reused from `evaluation` | `submission_production_<name>.csv` |
+| `production.choose_candidate` | `production/nodes.py` | Drops the candidates above `max_latency_p99_ms`, takes the best holdout PR-AUC, and of those within `pr_auc_tolerance` the fewest features (then the higher PR-AUC). If none is fast enough it chooses among all and says so. Writes `production_choice.json` and `production_candidates.md` |
+| `production.register_model` | `register_model` in `serving/nodes.py` | Logs the chosen train-only model with the column filter and encoders as one MLflow pyfunc (`InferenceBundle`), registers it as `fraud-detection` with the candidate name and feature count as tags, moves `@champion` if it wins. Outside a kedro run (tests) it only returns the summary |
+| `production.copy_submission` | `production/nodes.py` | The chosen candidate's file as `submission_production.csv`, the file to upload to Kaggle |
+
+`production_<name>` runs one candidate and registers nothing; `production_choose` runs only the
+last three nodes on the saved candidate outputs (every candidate must have run once).
 
 **Parameters** (`parameters_production.yml`):
 
 | Key | Value | Note |
 |---|---|---|
-| `n_features` | 100 | Top-N by the research importance; pick it from the feature-size study |
+| `candidates` | `lightgbm_100`, `lightgbm_50`, `xgboost_200`, `catboost_100` | name → `{model, n_features, param_overrides?}`; names are lowercase identifiers |
+| `selection.max_latency_p99_ms` | 20 | One-row model latency budget; `null` = none |
+| `selection.pr_auc_tolerance` | 0.005 | Holdout PR-AUC this close to the best counts as equally good, so the fewest features win |
 | `holdout_fraction` | 0.5 | Share of valid (its later days) kept as the holdout |
-| `param_overrides` | `{}` | On top of the research `best_params`, e.g. `{num_leaves: 31, max_depth: 6}` |
+| `param_overrides` | `{}` | On top of the research `best_params` for every candidate, e.g. `{num_leaves: 31, max_depth: 6}` |
 | `latency_rows` | 500 | Holdout rows timed one by one |
 
 **Parameters** (`parameters_serving.yml`):
@@ -469,11 +491,15 @@ flowchart TB
 | `threshold_metric` | `min_cost_threshold` | Which valid threshold is stored with the model. Alternatives: `at_fpr_threshold`, `best_f1_threshold`, `fixed_threshold` |
 | `promotion_metric` | `holdout_pr_auc` | Must be *higher is better*: the comparison is `score > champion`. A champion registered before (no `holdout_pr_auc` tag) counts as no champion |
 
-The registered model is the **train-only** `production.model`, so its threshold was picked for it.
-The holdout is mostly clean, not perfectly clean: the research `best_params` and the feature
-ranking were chosen on the full valid, which includes the holdout days (see
-[limitations](06_modeling_approach.md#known-limitations)). Champion and challenger are compared on
-the scores stored when each was registered; that is fair only while the holdout days stay the same.
+The registered model is the chosen candidate's **train-only** model, so its threshold was picked
+for it. The holdout is mostly clean, not perfectly clean: the research `best_params` and the
+feature ranking were chosen on the full valid, which includes the holdout days, and choosing among
+the candidates on it adds a little optimism (see
+[limitations](06_modeling_approach.md#known-limitations)). The choice can prefer a smaller
+candidate whose PR-AUC is slightly below the current champion's; then `@champion` stays where it
+is, `serving_registration.json` says `promoted: false`, and the API keeps serving the champion
+while `submission_production.csv` is the new choice. Champion and challenger are compared on the
+scores stored when each was registered; that is fair only while the holdout days stay the same.
 
 ---
 
@@ -486,7 +512,7 @@ the scores stored when each was registered; that is fair only while the holdout 
 | `tests/pipelines/test_data_cleaning.py` | Time ordering of the split, each filter rule, protected columns, single-row apply, missing-column error |
 | `tests/pipelines/test_feature_engineering.py` | Stateless features, native vs coded encodings, **single row = batch**, unseen values |
 | `tests/pipelines/test_training.py` | All six models train on CPU and score one row; class weights and undersampling (train only); refit tree count and `refit: false`; expanding CV folds; Optuna merges params; `n_trials=0` path |
-| `tests/pipelines/test_production.py` | Top-N feature selection; fitting frames keep ID + target; the holdout is the latest rows; param overrides and run name; holdout metrics use the valid threshold; the whole pipeline end to end (model and refit on the chosen features, submission, registration summary); a production pipeline per model type |
+| `tests/pipelines/test_production.py` | Top-N feature selection; fitting frames keep ID + target; the holdout is the latest rows; param overrides and run name; holdout metrics use the valid threshold; the choice rule (latency budget, tolerance, fewest features, no candidate fast enough); the whole pipeline end to end with two candidates (models and refits on their features, the choice, the copied submission, the registration summary); a pipeline per candidate plus the choice; invalid candidate names |
 | `tests/pipelines/test_evaluation.py` | Threshold metrics; the min-cost threshold equals a brute-force search; SHAP values add up to the prediction; SHAP ranks the signal first; submission format, rank-average blend; the blend uses only boosting models and submissions use `final_model` |
 | `tests/test_inference.py` | `InferenceBundle` reproduces the batch model input and scores (single rows too); bad rows raise; the NumPy fast path equals the pandas path for every batch size and model type; pyfunc round trip; registration promotes only better models; `/explain` contributions add up to the score |
 | `tests/api/test_api.py` | Liveness/readiness with and without a model, warm-up, single and batch scoring (order, size limits), threshold precedence, 422/500 error mapping, request-ID and timing headers, prediction log, `/metrics`, `/explain` |

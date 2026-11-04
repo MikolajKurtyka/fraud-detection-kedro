@@ -7,7 +7,7 @@
 - **Task**: binary classification, the probability that a card-not-present transaction is fraudulent
 - **Algorithms**: LightGBM, XGBoost and CatBoost, plus logistic regression, random forest and scikit-learn HistGradientBoosting as baselines, all trained on the same features and compared. Hyperparameter tuning with Optuna (PR-AUC) is built in but hasn't been run yet. LightGBM is currently the best
 - **Input**: raw transaction + identity columns, turned into 395 features by `InferenceBundle` (see [5. Pipelines](05_pipelines.md#feature_engineering))
-- **Variants**: research `{model}.pkl` (train only, the one with validated metrics) and `{model}_final.pkl` (refitted on train + valid). The **production** model (`production.pkl`, `production_final.pkl`) is one model type with its research params on its top-N features (`conf/base/parameters_production.yml`); the train-only one is served, the refit one writes `submission_production.csv`
+- **Variants**: research `{model}.pkl` (train only, the one with validated metrics) and `{model}_final.pkl` (refitted on train + valid). The **production** model is the candidate chosen by `production.selection` among a few model types with their research params on their top-N features (`conf/base/parameters_production.yml`, `data/08_reporting/production_candidates.md`); its train-only model is served, its refit writes `submission_production.csv`
 - **Version**: tracked in the MLflow registry as `fraud-detection`; the served version carries the `champion` alias and every API response names it (`model_version`). The registered artifact is the full inference bundle (column filter + feature encoders + LightGBM), with its threshold, cost per 1k, holdout PR-AUC and training run ID as tags (see [7. Serving API](07_serving_api.md#how-a-model-reaches-the-api))
 - **Owner**: Mikolaj Kurtyka
 
@@ -45,8 +45,8 @@ fraud. At its best-F1 threshold, 73% of flagged transactions are fraud and 50% o
 
 These scores are slightly optimistic: early stopping picked the number of trees on the same
 validation split, and the best-F1 and min-cost thresholds were chosen on it too (see
-[6. Modeling approach](06_modeling_approach.md#known-limitations)). The production model's
-`holdout_*` metrics (`data/08_reporting/production_evaluation.json`) are the honest numbers. Kaggle submissions
+[6. Modeling approach](06_modeling_approach.md#known-limitations)). The production candidates'
+`holdout_*` metrics (`data/08_reporting/production_<candidate>_evaluation.json`) are the honest numbers. Kaggle submissions
 (`data/07_model_output/`) have been written but not uploaded, so there's no test-set score yet.
 
 ## Explainability

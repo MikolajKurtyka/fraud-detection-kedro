@@ -206,20 +206,28 @@ model's accuracy with a third of the columns to compute, monitor and explain.
 ### From research to the production model
 
 The research track (`training`, `evaluation`, the study above) compares every model on every
-feature. The `production` pipeline turns one result into the model used for **both** the Kaggle
-submission and the API:
+feature. The `production` pipeline turns a short list of results, the **candidates**
+(`production.candidates`, e.g. `lightgbm_100`, `lightgbm_50`, `xgboost_200`, `catboost_100`), into
+the one model used for **both** the Kaggle submission and the API:
 
-- **Model type**: by pipeline name (`production` = LightGBM, `production_<model>` another).
-- **Features**: the top `production.n_features` (default 100) of that model's research importance.
+- **Candidates**: a model type and a feature count each, picked from the study above. Not every
+  model at every size: that costs many hours, and choosing among many on one holdout would make
+  the winner's number optimistic again.
+- **Features**: each candidate's top `n_features` of its model's research importance.
   Fewer is better if accuracy holds: fewer columns to compute, monitor and explain.
 - **Params**: the research `best_params`, plus `production.param_overrides` for a smaller model
   (e.g. the compact settings above).
 - **Holdout**: valid is cut by time into two halves. The earlier half is used for early stopping
   and picking the threshold; the later half is the holdout, where the model is scored at that
-  threshold. `holdout_pr_auc` decides the `@champion` promotion, and `production_evaluation.json`
-  also records `n_features` and one-row latency, so accuracy and speed sit side by side.
-- **Kaggle**: the same config refitted on all labelled data (`submission_production.csv`).
-  The API serves the train-only model, because its threshold was picked for it.
+  threshold. Each `production_<candidate>_evaluation.json` also records `n_features` and
+  one-row latency, so accuracy and speed sit side by side (`production_candidates.md` has them all).
+- **Choice** (`production.selection`): drop the candidates above the latency budget
+  (`max_latency_p99_ms: 20`), take the best holdout PR-AUC, and of the candidates within
+  `pr_auc_tolerance` (0.005) of it the fewest features. `@champion` moves to the chosen one only
+  if its `holdout_pr_auc` beats the current champion.
+- **Kaggle**: the chosen candidate refitted on all labelled data (`submission_production.csv`);
+  every candidate also keeps its own file. The API serves the train-only model, because its
+  threshold was picked for it.
 
 ```mermaid
 flowchart LR
@@ -227,7 +235,7 @@ flowchart LR
         A1["train<br/>days 1–140"] --> B1["valid days 141–182<br/>early stopping · tuning<br/>feature ranking · study"]
     end
     subgraph production["Production: same train, valid cut in two"]
-        A2["train<br/>top-N features"] --> B2["valid, earlier half<br/>early stopping · threshold"] --> C2["holdout, later half<br/>reported metrics · promotion"]
+        A2["train<br/>top-N features<br/>per candidate"] --> B2["valid, earlier half<br/>early stopping · threshold"] --> C2["holdout, later half<br/>reported metrics · choice ·<br/>promotion"]
     end
     research -->|"best_params,<br/>feature ranking"| production
 ```
@@ -439,7 +447,7 @@ from tuning.
    holdout (the later half of valid) that it never fits, early-stops or picks a threshold on
    ([above](#from-research-to-the-production-model)). It is mostly clean, not perfectly clean:
    the research `best_params` and feature ranking it reuses were chosen on the full valid,
-   holdout days included. A fully clean holdout would need the research split to leave those
+   holdout days included, and choosing among a few candidates on it adds a little optimism. A fully clean holdout would need the research split to leave those
    days out too.
 2. **Train–valid gap of ~0.07 ROC-AUC** for all models (LightGBM train ROC-AUC 0.999). This
    suggests overfitting (256 leaves, depth 13) and/or remaining drift. Try stronger

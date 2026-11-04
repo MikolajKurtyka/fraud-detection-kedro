@@ -15,7 +15,7 @@ flowchart LR
     end
     A1[/column_filter.json/] --> CF
     A2[/feature_encoders.pkl/] --> FE & BM
-    A3[/"production.pkl + production_evaluation.json"/] --> P
+    A3[/"chosen production_&lt;candidate&gt;.pkl<br/>+ its evaluation"/] --> P
     bundle -->|"production pipeline<br/>FraudPyfunc"| REG[("Registry<br/>fraud-detection")]
     REG -->|"@champion<br/>(only if holdout PR-AUC improves)"| API[FastAPI]
 ```
@@ -24,21 +24,22 @@ flowchart LR
    the data_ingestion typing rules (categorical keys via `to_key`, dtypes, `id-01` → `id_01`) to
    the columns the column filter keeps. Lookup tables are converted to indexed Series once, which
    gives identical results and avoids re-hashing 100k-key dicts on every request.
-2. The `production` pipeline (`make production`) trains the production model (one model type,
-   its research params, its top-N features), wraps it in the bundle as an MLflow pyfunc and
-   registers it as `fraud-detection`. It stores in the model metadata:
+2. The `production` pipeline (`make production`) trains a few candidates (a model type with its
+   research params on its top-N features), reports each on a holdout and chooses one: within
+   the latency budget, best holdout PR-AUC, fewest features among the near-best (see
+   [README](../README.md#research-vs-production)). It wraps the chosen one in the bundle as an
+   MLflow pyfunc and registers it as `fraud-detection`. It stores in the model metadata:
    - the decision **threshold**: `serving.threshold_metric`, default `min_cost_threshold` (the
      lowest expected cost on valid, see `evaluation.cost`; `at_fpr_threshold` flags ~1% of
      legitimate transactions instead), with its `cost_per_1k`;
-   - the model type;
+   - the model type, the candidate name and its number of features;
    - holdout PR-AUC (`holdout_pr_auc`, from rows the model was never fitted or tuned on).
 3. `@champion` moves to the new version only if its `serving.promotion_metric` beats the current
    champion's. The result is written to `data/08_reporting/serving_registration.json`.
-   `production_<model>` builds it from another model type.
 
-The registered model is the **train-only** `production.model`, so the threshold and metrics stored
-with it describe exactly that model. The Kaggle submission uses the same config refitted on all
-labelled data. The API needs no change for the smaller feature set: the bundle builds every
+The registered model is the chosen candidate's **train-only** model, so the threshold and metrics
+stored with it describe exactly that model. The Kaggle submission uses the same candidate
+refitted on all labelled data. The API needs no change for the smaller feature set: the bundle builds every
 feature and the model selects its own columns (`FraudModel.feature_columns`).
 
 **Parity** is tested in `tests/test_inference.py`: raw rows sent the way the API sends them
@@ -181,7 +182,7 @@ stored rules and get only the unknown-column check.
 ## Running it
 
 ```bash
-make production                                                   # build, register + maybe promote
+make production                                                   # candidates, choose, register + maybe promote
 MLFLOW_TRACKING_URI=sqlite:///mlflow.db make api                  # http://localhost:8000/docs
 MLFLOW_TRACKING_URI=sqlite:///mlflow.db make api-prod WORKERS=8   # several workers, as in Docker
 MICROBATCH_WAIT_MS=2 make api-prod                                # ... with micro-batching on
