@@ -72,6 +72,73 @@ reliable.
 All thresholds live in `parameters_data_cleaning.yml`, so you can tune them like hyperparameters
 (e.g. try `v_correlation_threshold: 0.9`).
 
+### Missing values and outliers: the policy
+
+**No imputation and no outlier treatment, on purpose.** Invalid data stops the run. Valid but
+unusual data stays in, unchanged. The model learns from both.
+
+**Missing values stay NaN.** Why:
+
+- **Missingness is a signal here.** Nulls come in blocks: the identity columns are empty when a
+  transaction has no identity row, and each `V` / `D` block is either all filled or all empty.
+  Whether a block is filled says something about the product and the channel. If we filled the
+  gaps with a median, the model could no longer tell "missing" from "typical".
+- **The trees handle NaN themselves.** At every split they learn which side the missing values
+  go to, so imputing gives them nothing they don't already have.
+- **Nothing extra to fit and copy to serving.** An imputer is one more fitted artifact that the
+  API would have to apply exactly as training did. A request that leaves out a column is simply
+  NaN, the same as in training.
+
+How each model receives missing values:
+
+| Model | Numerical NaN | Categorical NaN |
+|---|---|---|
+| LightGBM, XGBoost, HistGB | native (learned split direction) | native |
+| CatBoost | native (`nan_mode` default: treated as the smallest value) | the string `"__missing__"` as its own category |
+| Random forest | native (scikit-learn ≥ 1.4) | category code → NaN |
+| Logistic regression (baseline only) | **median imputation + a missing-indicator column** per feature, fitted on train inside its sklearn pipeline | `"__missing__"` category, one-hot encoded |
+
+Logistic regression is the only exception: a linear model can't take NaN. It is a baseline and
+never goes to production.
+
+What may *not* be missing:
+
+| Rule | Where | On failure |
+|---|---|---|
+| `TransactionID`, `TransactionDT`, `TransactionAmt`, `ProductCD` never null (`required_columns`) | `data_validation` (pandera) | run stops |
+| The same required columns, per request | `FraudPyfunc.check_records` at the API ([serving](07_serving_api.md#request-transaction)) | HTTP 422 |
+| Null share per column in test within 0.25 of train (`max_null_rate_diff`) | `data_validation` | run stops: a jump means a broken file or join, not a real change |
+
+New values become NaN too. A category or client (UID) that wasn't in train gets NaN group
+statistics and frequency 0, never a made-up value
+([limitation 7](#known-limitations)).
+
+**Outliers are kept as they are.** No clipping, winsorising or row removal. Why:
+
+- **In fraud, the extreme values are often the fraud.** An unusually large amount for a card is
+  exactly the pattern the model has to learn. Clipping it would remove the signal, and dropping
+  those rows would remove fraud cases from train.
+- **Trees only look at order.** A split is a threshold, so a value 100× larger than the rest
+  just ends up on the far side of that threshold. It doesn't pull the model the way it pulls a
+  mean or a linear model.
+- **Production will see these values anyway.** If train excludes them, the model meets them for
+  the first time on live traffic.
+
+"Unusual" is turned into features instead of being removed: `TransactionAmt_to_mean_card1` and
+the other `*_to_mean_*` / `*_to_std_*` ratios say how far a value is from the client's or card's
+usual one ([feature engineering](05_pipelines.md)).
+
+What *is* checked is **validity** (`value_ranges` in `parameters_data_validation.yml`):
+`TransactionAmt > 0`, `TransactionDT ≥ 0`. A value outside these ranges is a data error, not an
+outlier. In the pipeline the run stops; at the API the request gets a 422. The value is never
+silently "fixed".
+
+**When to revisit this:** a linear model or neural network goes to production (it needs
+imputation and scaling, fitted on train and shipped in the bundle); a column's nulls start to
+mean something else (e.g. an upstream bug instead of "not collected"; the null-rate check above
+is the guard); or a validity rule turns out to be missing (add it to `value_ranges`, not a
+clip).
+
 ### Current top features (built-in importance)
 
 | Rank | LightGBM | XGBoost | CatBoost |
