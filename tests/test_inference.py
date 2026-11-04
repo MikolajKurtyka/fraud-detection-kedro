@@ -7,7 +7,9 @@ Both serving paths are checked: the pandas path (``predict_proba``) and the NumP
 (``predict_records``), which must give exactly the same features and scores.
 """
 
+import dataclasses
 import pickle
+import re
 from types import SimpleNamespace
 
 import mlflow
@@ -68,6 +70,12 @@ FEATURES = {
     "frequency_columns": ["card1", "uid"],
     "max_native_categories": 3,
     "drop_columns": ["TransactionDT", "day", "uid", "D1", "D15"],
+}
+VALIDATION = {  # parameters_data_validation.yml shape; only the last two reach the bundle
+    "time_column": "TransactionDT",
+    "fail_on_error": True,
+    "required_columns": [KEY, "TransactionDT", "TransactionAmt"],
+    "value_ranges": {"TransactionDT": {"ge": 0}, "TransactionAmt": {"gt": 0}},
 }
 SERVING = {
     "registered_model_name": "fraud-detection",
@@ -288,6 +296,69 @@ def test_pyfunc_loads_bundle(fitted, tmp_path):
     )
 
 
+def _checked(bundle) -> InferenceBundle:
+    rules = {k: VALIDATION[k] for k in ("required_columns", "value_ranges")}
+    return dataclasses.replace(bundle, validation_params=rules)
+
+
+def test_check_records_accepts_valid_rows(fitted):
+    bundle, raw, _ = fitted
+    # String amounts, left-out nulls and id-01 style names are all valid
+    assert _checked(bundle).check_records(_api_records(raw)) == {}
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"TransactionAmt": -5}, "TransactionAmt must be > 0, got -5"),
+        ({"TransactionAmt": "0"}, "TransactionAmt must be > 0, got '0'"),
+        ({"TransactionAmt": None}, "TransactionAmt is required"),
+        ({"TransactionAmt": float("nan")}, "TransactionAmt is required"),
+        ({"TransactionAmt": "abc"}, "TransactionAmt must be a number, got 'abc'"),
+        ({"TransactionDT": -1}, "TransactionDT must be >= 0, got -1"),
+    ],
+)
+def test_check_records_rejects_invalid_values(fitted, change, message):
+    bundle, raw, _ = fitted
+    records = _api_records(raw.head(3))
+    records[1] = {**records[1], **change}
+    with pytest.raises(ValueError, match=re.escape(message)) as err:
+        _checked(bundle).check_records(records)
+    assert f"{KEY} {records[1][KEY]}" in str(err.value)  # names the bad row
+
+
+def test_check_records_rejects_absent_required_column(fitted):
+    bundle, raw, _ = fitted
+    records = _api_records(raw.head(1))
+    del records[0]["TransactionAmt"]
+    with pytest.raises(ValueError, match="TransactionAmt is required"):
+        _checked(bundle).check_records(records)
+
+
+def test_check_records_caps_the_message(fitted):
+    bundle, raw, _ = fitted
+    records = [{**r, "TransactionAmt": -1} for r in _api_records(raw.head(8))]
+    with pytest.raises(ValueError, match=r"\.\.\. and 3 more$"):
+        _checked(bundle).check_records(records)
+
+
+def test_check_records_counts_unknown_columns(fitted):
+    bundle, raw, _ = fitted
+    records = _api_records(raw.head(3))
+    records[0]["transactionamt"] = 5  # misspelled: would be scored as missing
+    records[1]["transactionamt"] = 7
+    records[2]["client_note"] = "x"
+    assert _checked(bundle).check_records(records) == {"client_note": 1, "transactionamt": 2}
+
+
+def test_check_records_without_rules_only_counts_unknown(fitted):
+    """Bundles registered before validation_params existed load with None: no rules apply."""
+    bundle, raw, _ = fitted
+    records = [{**_api_records(raw.head(1))[0], "TransactionAmt": -5, "typo": 1}]
+    assert bundle.validation_params is None
+    assert bundle.check_records(records) == {"typo": 1}
+
+
 def _register(bundle, pr_auc: float) -> dict:
     evaluation = {"best_f1_threshold": 0.3, "pr_auc": pr_auc}
     with mlflow.start_run():
@@ -300,6 +371,7 @@ def _register(bundle, pr_auc: float) -> dict:
             FEATURES,
             TARGET,
             SERVING,
+            VALIDATION,
         )
 
 
@@ -334,6 +406,14 @@ def test_register_promotes_only_better_models(fitted, tmp_path, monkeypatch):
         np.testing.assert_allclose(loaded.predict(raw.head(3)), bundle.predict_proba(raw.head(3)))
         records = _api_records(raw.head(3))  # what the API sends: MLflow passes the list through
         np.testing.assert_array_equal(loaded.predict(records), bundle.predict_records(records))
+
+        # The validation rules travel with the model, so the API applies them
+        served = loaded.unwrap_python_model()
+        assert served.bundle.validation_params == {
+            k: VALIDATION[k] for k in ("required_columns", "value_ranges")
+        }
+        with pytest.raises(ValueError, match="TransactionAmt must be > 0"):
+            served.check_records([{**records[0], "TransactionAmt": -5}])
     finally:
         mlflow.set_tracking_uri(None)
 

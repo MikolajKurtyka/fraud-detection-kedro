@@ -96,6 +96,7 @@ sequenceDiagram
     C->>MW: POST /predict {TransactionID, features}
     MW->>EP: request_id (X-Request-ID or new)
     Note over EP: pydantic validates Transaction<br/>(422 on bad payload)
+    Note over EP: check_records: required columns,<br/>value ranges (422), unknown names (warn)
     alt micro-batching off (default)
         EP->>PF: predict([record]) in a worker thread
     else micro-batching on
@@ -132,8 +133,24 @@ while the process runs: after `@champion` moves, restart the API (or roll the co
 ```
 
 `features` holds the **raw** transaction and identity columns, named as in the Kaggle files.
-Absent columns are treated as null; `TransactionDT` is required. `has_identity` is derived (1 if
-any identity column is set) unless sent.
+Absent columns are treated as null. `has_identity` is derived (1 if any identity column is set)
+unless sent.
+
+Before scoring, `FraudPyfunc.check_records` applies the same rules `data_validation` applies to
+the batch tables (`required_columns` and `value_ranges` from `parameters_data_validation.yml`,
+stored in the model bundle at registration):
+
+| Input | Response |
+|---|---|
+| A required column (`TransactionDT`, `TransactionAmt`, `ProductCD`) absent or null | **422**, e.g. `Invalid input: TransactionAmt is required (TransactionID 3)` |
+| A value outside its range (`TransactionAmt > 0`, `TransactionDT ≥ 0`) or not a number | **422**, e.g. `Invalid input: TransactionAmt must be > 0, got -5 (TransactionID 3)` |
+| A column name no raw table defines (typo, extra client field) | **200**, scored with that column treated as missing. Counted in `fraud_unknown_columns_total`, and a warning is logged the first time each name shows up in a worker |
+
+Invalid values are rejected rather than scored: the model never saw them in training, so its
+score for them would mean nothing. Unknown names are not rejected, so a client that sends extra
+fields keeps working. A misspelled feature, though, is scored as if missing; alert on
+`rate(fraud_unknown_columns_total[5m]) > 0`. Models registered before this check existed have no
+stored rules and get only the unknown-column check.
 
 ### Response: `Prediction`
 

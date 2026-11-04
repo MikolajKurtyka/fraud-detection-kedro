@@ -63,6 +63,12 @@ PROBABILITY = Histogram(
     buckets=[i / 20 for i in range(1, 21)],
 )
 PREDICTIONS = Counter("fraud_predictions", "Scored transactions.", ["model_version", "is_fraud"])
+# No column label: the names come from clients, so a label would have unbounded cardinality
+UNKNOWN_COLUMNS = Counter(
+    "fraud_unknown_columns",
+    "Values sent under column names the model's schema does not define (scored as missing).",
+)
+_warned_columns: set[str] = set()  # per worker: warn once per name, then only count
 
 
 @dataclass(frozen=True)
@@ -223,6 +229,29 @@ def health(request: Request) -> Health:
     return _health(_service(request), "ok")
 
 
+def _python_model(pyfunc: Any) -> Any:
+    """The registered pyfunc wraps FraudPyfunc; check_records() and explain() live on it."""
+    return pyfunc.unwrap_python_model() if hasattr(pyfunc, "unwrap_python_model") else pyfunc
+
+
+def _record_unknown_columns(unknown: dict[str, int]) -> None:
+    """Count values sent under unknown names; warn the first time each name shows up.
+
+    Not rejected, so a client sending an extra field keeps working. But a misspelled
+    feature is scored as missing, so it must be visible."""
+    if not unknown:
+        return
+    UNKNOWN_COLUMNS.inc(sum(unknown.values()))
+    new = sorted(unknown.keys() - _warned_columns)
+    if new:
+        _warned_columns.update(new)
+        logger.warning(
+            "Request has columns the model does not know, scored as if missing: %s "
+            "(warned once per name; see the fraud_unknown_columns_total metric)",
+            new[:20],
+        )
+
+
 def _model_scores(state: ServiceState, txs: list[Transaction]) -> np.ndarray:
     """One model call for all transactions; errors as the HTTP errors the API returns."""
     model = state.model
@@ -231,7 +260,10 @@ def _model_scores(state: ServiceState, txs: list[Transaction]) -> np.ndarray:
             status_code=503, detail="Model not loaded. Train and promote one first."
         )
     records = [{**tx.features, "TransactionID": tx.TransactionID} for tx in txs]
+    python_model = _python_model(model.pyfunc)
     try:
+        if hasattr(python_model, "check_records"):  # required columns and value ranges
+            _record_unknown_columns(python_model.check_records(records))
         probas = np.asarray(model.pyfunc.predict(records), dtype=float).ravel()
     except (ValueError, KeyError) as exc:
         logger.exception("Prediction rejected input")
@@ -328,11 +360,7 @@ def explain(tx: Transaction, request: Request, top_k: int = Query(10, ge=1, le=5
     """Score one transaction and return the ``top_k`` features with the largest SHAP values."""
     state = _service(request)
     prediction = _score(request, [tx])[0]
-    pyfunc = state.model.pyfunc
-    # The registered pyfunc wraps FraudPyfunc; explain() lives on that inner model
-    python_model = (
-        pyfunc.unwrap_python_model() if hasattr(pyfunc, "unwrap_python_model") else pyfunc
-    )
+    python_model = _python_model(state.model.pyfunc)
     if not hasattr(python_model, "explain"):
         raise HTTPException(status_code=501, detail="This model cannot explain predictions.")
     record = {**tx.features, "TransactionID": tx.TransactionID}

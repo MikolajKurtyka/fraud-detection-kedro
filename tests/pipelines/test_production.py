@@ -131,6 +131,7 @@ def test_production_pipeline_end_to_end():
         "params:evaluation": EVAL_PARAMS,
         "params:serving": SERVING,
         "params:data_ingestion": {},
+        "params:data_validation": {},
         "params:feature_engineering": {},
         "params:feature_engineering.join_key": KEY,
         "params:target": TARGET,

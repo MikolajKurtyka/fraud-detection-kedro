@@ -30,6 +30,18 @@ class FakeModel:
         amt = [r.get("TransactionAmt", 0) for r in records]
         return np.clip(np.asarray(amt, dtype=float) / 100, 0, 1)
 
+    def check_records(self, records):
+        """Like InferenceBundle.check_records: TransactionAmt > 0; ``unknown_*`` names unknown."""
+        for r in records:
+            if r.get("TransactionAmt", 1) <= 0:
+                raise ValueError(f"TransactionAmt must be > 0 (TransactionID {r['TransactionID']})")
+        unknown = {}
+        for r in records:
+            for name in r:
+                if name.startswith("unknown_"):
+                    unknown[name] = unknown.get(name, 0) + 1
+        return unknown
+
     def explain(self, records, top_k):
         """Two fixed contributions per row; the amount pushes towards fraud."""
         if any("boom" in r for r in records):
@@ -45,6 +57,7 @@ class FakeModel:
 def _env(monkeypatch):
     monkeypatch.delenv("FRAUD_THRESHOLD", raising=False)
     monkeypatch.delenv("MODEL_URI", raising=False)
+    monkeypatch.setattr(main, "_warned_columns", set())
 
 
 @pytest.fixture
@@ -189,6 +202,44 @@ def test_model_errors_map_to_422_and_500(fake_model):
     assert bad.status_code == 422
     assert "boom" in bad.json()["detail"]
     assert crash.status_code == 500
+
+
+def test_invalid_values_are_rejected_not_scored(fake_model):
+    with TestClient(app) as client:
+        warm_up_calls = len(fake_model.calls)
+        single = client.post("/predict", json=tx(3, -5))
+        batch = client.post("/predict/batch", json=[tx(1, 5), tx(2, -5)])
+        explain = client.post("/explain", json=tx(4, 0))
+    for resp in (single, batch, explain):
+        assert resp.status_code == 422
+        assert "TransactionAmt must be > 0" in resp.json()["detail"]
+    assert "TransactionID 3" in single.json()["detail"]
+    assert len(fake_model.calls) == warm_up_calls  # rejected before the model scored anything
+
+
+def _unknown_count(client) -> float:
+    for line in client.get("/metrics").text.splitlines():
+        if line.startswith("fraud_unknown_columns_total "):
+            return float(line.split()[1])
+    raise AssertionError("fraud_unknown_columns_total not exported")
+
+
+def test_unknown_columns_are_scored_counted_and_warned_once(fake_model, caplog):
+    with (
+        caplog.at_level(logging.WARNING, logger="fraud_detection.api.main"),
+        TestClient(app) as client,
+    ):
+        before = _unknown_count(client)
+        first = client.post("/predict", json=tx(1, 50, unknown_amt=5))
+        again = client.post(
+            "/predict/batch", json=[tx(2, 50, unknown_amt=5), tx(3, 50, unknown_x=1)]
+        )
+        after = _unknown_count(client)
+    assert first.status_code == again.status_code == 200
+    assert after - before == 3
+    warnings = [r.getMessage() for r in caplog.records if "does not know" in r.getMessage()]
+    assert len(warnings) == 2  # unknown_amt once, then unknown_x once
+    assert "unknown_amt" in warnings[0] and "unknown_x" in warnings[1]
 
 
 def test_request_id_echo_and_timing(fake_model):

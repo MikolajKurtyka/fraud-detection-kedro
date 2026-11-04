@@ -10,6 +10,7 @@ MLflow pyfunc model for the registry and API.
 """
 
 import logging
+import operator
 import pickle
 from dataclasses import dataclass
 from functools import cached_property
@@ -18,7 +19,7 @@ import mlflow.pyfunc
 import numpy as np
 import pandas as pd
 
-from fraud_detection.fast_inference import RecordScorer
+from fraud_detection.fast_inference import RecordScorer, _is_missing, _normalize_names
 from fraud_detection.keys import to_key
 from fraud_detection.pipelines.data_cleaning.nodes import apply_column_filter
 from fraud_detection.pipelines.data_ingestion.nodes import (
@@ -35,6 +36,13 @@ from fraud_detection.pipelines.training.model import FraudModel
 logger = logging.getLogger(__name__)
 
 TABLES = ("transaction", "identity")
+# Same operators as data_validation's pandera checks, with the sign for error messages
+_RANGE_CHECKS = {
+    "gt": (operator.gt, ">"),
+    "ge": (operator.ge, ">="),
+    "lt": (operator.lt, "<"),
+    "le": (operator.le, "<="),
+}
 
 
 @dataclass
@@ -45,6 +53,9 @@ class InferenceBundle:
     ingestion_params: dict
     feature_params: dict
     target: str
+    # data_validation's required_columns / value_ranges, checked per request. None in bundles
+    # registered before it existed: those get only the unknown-column check.
+    validation_params: dict | None = None
 
     def __getstate__(self) -> dict:
         """Pickle the fitted artifacts only; the ``_``-prefixed caches are rebuilt on use."""
@@ -97,6 +108,56 @@ class InferenceBundle:
             "frequency": {col: lookup(m) for col, m in enc["frequency"].items()},
             "categorical": categorical,
         }
+
+    @cached_property
+    def _known_columns(self) -> frozenset[str]:
+        """Every column a request may send: both raw tables, the key, target and has_identity."""
+        schema = self.ingestion_params["schema"]
+        names = {
+            c
+            for t in TABLES
+            for kind in ("categorical", "numerical")
+            for c in expand_columns(schema[t][kind])
+        }
+        return frozenset({*names, self.ingestion_params["join_key"], self.target, "has_identity"})
+
+    def check_records(self, records: list[dict]) -> dict[str, int]:
+        """Per-request version of the data_validation rules, for raw rows as dicts.
+
+        Raises ``ValueError`` (the API's 422) if a ``required_columns`` entry is missing or
+        null, or a value is outside ``value_ranges``: invalid data is rejected, never scored.
+        Returns the columns no raw table defines, with how many rows sent each. They are
+        ignored, so a misspelled name is scored as a missing value; the caller should warn.
+        """
+        rules = self.validation_params or {}
+        key = self.ingestion_params["join_key"]
+        errors: list[str] = []
+        unknown: dict[str, int] = {}
+        for record in records:
+            record = _normalize_names(record)
+            for col in record.keys() - self._known_columns:
+                unknown[col] = unknown.get(col, 0) + 1
+            row = f"{key} {record.get(key)}"
+            for col in rules.get("required_columns", []):
+                if _is_missing(record.get(col)):
+                    errors.append(f"{col} is required ({row})")
+            for col, bounds in rules.get("value_ranges", {}).items():
+                value = record.get(col)
+                if _is_missing(value):
+                    continue  # null-or-not is required_columns' job
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    errors.append(f"{col} must be a number, got {value!r} ({row})")
+                    continue
+                for op, bound in bounds.items():
+                    compare, sign = _RANGE_CHECKS[op]
+                    if not compare(number, bound):
+                        errors.append(f"{col} must be {sign} {bound}, got {value!r} ({row})")
+        if errors:
+            more = [f"... and {len(errors) - 5} more"] if len(errors) > 5 else []
+            raise ValueError("; ".join(errors[:5] + more))
+        return dict(sorted(unknown.items()))
 
     def type_raw(self, raw: pd.DataFrame) -> pd.DataFrame:
         """Type raw rows with the data_ingestion rules; absent columns become null.
@@ -189,6 +250,10 @@ class FraudPyfunc(mlflow.pyfunc.PythonModel):
         if isinstance(model_input, pd.DataFrame):
             return self.bundle.predict_proba(model_input)
         return self.bundle.predict_records(model_input)
+
+    def check_records(self, records: list[dict]) -> dict[str, int]:
+        """Request validation (see ``InferenceBundle.check_records``); the API calls it first."""
+        return self.bundle.check_records(records)
 
     def explain(self, records: list[dict], top_k: int = 10) -> list[list[dict]]:
         """Top SHAP contributions per row (see ``InferenceBundle.explain_records``)."""

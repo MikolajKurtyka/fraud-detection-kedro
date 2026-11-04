@@ -34,6 +34,7 @@ def register_model(
     feature_params: dict,
     target: str,
     params: dict,
+    validation_params: dict | None = None,
 ) -> dict:
     """Log the full inference chain as one MLflow pyfunc model, register it, and move the
     alias to it if it beats the current champion on valid.
@@ -78,6 +79,10 @@ def register_model(
         ingestion_params=ingestion_params,
         feature_params=feature_params,
         target=target,
+        # The API rejects requests that break the rules data_validation applies to batches
+        validation_params=None
+        if validation_params is None
+        else {k: validation_params[k] for k in ("required_columns", "value_ranges")},
     )
     metadata = {
         "model_type": model.model_type,
